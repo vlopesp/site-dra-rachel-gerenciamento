@@ -3,6 +3,7 @@ import pandas as pd
 import hashlib
 import io
 import os
+import base64
 from datetime import datetime
 from difflib import SequenceMatcher
 from streamlit_gsheets import GSheetsConnection
@@ -94,10 +95,21 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-# Function para exibir o Logo da Dra. Rachel
-def render_logo():
+# Function para exibir o Logo da Dra. Rachel com renderização em Alta Definição (Base64)
+def render_logo(width=300, center=True):
     if os.path.exists("logo.png"):
-        st.image("logo.png", width=240)
+        with open("logo.png", "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode()
+        
+        align_css = "margin: 0 auto; display: block;" if center else "margin: 0;"
+        container_align = "center" if center else "left"
+        
+        st.markdown(f"""
+            <div style="text-align: {container_align}; padding: 10px 0;">
+                <img src="data:image/png;base64,{encoded_string}" 
+                     style="width: {width}px; max-width: 100%; height: auto; image-rendering: -webkit-optimize-contrast; {align_css}" />
+            </div>
+        """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
             <div style="text-align: center; margin-bottom: 20px;">
@@ -147,7 +159,7 @@ def login_screen():
     col1, col2, col3 = st.columns([1, 1.8, 1])
     with col2:
         st.write("")
-        render_logo()
+        render_logo(width=340, center=True)
         st.markdown("<h4 style='text-align: center; color: #777;'>Acesso ao Sistema</h4>", unsafe_allow_html=True)
         
         with st.form("login_form"):
@@ -172,9 +184,9 @@ if not st.session_state.authenticated:
 # ==========================================
 # 4. CABEÇALHO DO PAINEL PRINCIPAL
 # ==========================================
-c_logo, c_user = st.columns([4, 1])
+c_logo, c_user = st.columns([3, 1])
 with c_logo:
-    render_logo()
+    render_logo(width=280, center=False)
 with c_user:
     st.write(f"👤 `{st.session_state.current_user}`")
     if st.button("Sair / Logout"):
@@ -494,7 +506,7 @@ with tab_pac:
                     st.write(f"• {item}")
 
 # ------------------------------------------
-# TAB 5: CONFIGURAÇÕES & TAXAS (NOVA GUIA)
+# TAB 5: CONFIGURAÇÕES & TAXAS
 # ------------------------------------------
 with tab_cfg:
     st.subheader("⚙️ Configurações do Consultório e Taxas de Cartão")
