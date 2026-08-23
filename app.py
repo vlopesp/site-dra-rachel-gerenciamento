@@ -201,7 +201,7 @@ def sanitize_str(text):
     return text_clean.strip().replace(' ', '_')
 
 # ==========================================
-# 3. AUTENTICAÇÃO SEGURA
+# 3. AUTENTICAÇÃO SEGURA COM PERSISTÊNCIA DE SESSÃO
 # ==========================================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -215,6 +215,12 @@ if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'current_user' not in st.session_state:
     st.session_state.current_user = None
+
+# PERSISTÊNCIA DE LOGIN VIA URL (impede deslogar ao clicar em links/redirecionamentos)
+if not st.session_state.authenticated:
+    if "user" in st.query_params and st.query_params["user"] in USER_DATABASE:
+        st.session_state.authenticated = True
+        st.session_state.current_user = st.query_params["user"]
 
 def login_screen():
     col1, col2, col3 = st.columns([1, 1.8, 1])
@@ -233,6 +239,7 @@ def login_screen():
                 if username_input in USER_DATABASE and USER_DATABASE[username_input] == hashed_input:
                     st.session_state.authenticated = True
                     st.session_state.current_user = username_input
+                    st.query_params["user"] = username_input  # Mantém sessão salva na URL
                     st.success("Acesso liberado!")
                     st.rerun()
                 else:
@@ -243,7 +250,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 4. CABEÇALHO E DECLARAÇÃO DE ABAS
+# 4. CABEÇALHO E CONFIGURAÇÕES DE BASE
 # ==========================================
 c_logo, c_user = st.columns([3, 1])
 with c_logo:
@@ -253,6 +260,7 @@ with c_user:
     if st.button("Sair / Logout"):
         st.session_state.authenticated = False
         st.session_state.current_user = None
+        st.query_params.clear()  # Limpa o token da URL
         st.rerun()
 
 def export_to_excel(df):
@@ -277,6 +285,83 @@ aluguel_consulta = get_cfg_val('aluguel_consulta', 60.0)
 imposto_geral = get_cfg_val('imposto_geral', 6.0)
 lucro_geral = get_cfg_val('lucro_geral', 40.0)
 taxas_cartao = {i: get_cfg_val(f'taxa_{i}x', round(2.0 + (i * 0.8), 2)) for i in range(1, 13)}
+
+# FUNÇÃO MATEMÁTICA DE RECÁLCULO COMPLETO DE PROCEDIMENTOS
+def recalcular_procedimentos_df(df_p, df_m_ref, aluguel_cons, imposto_g, lucro_g, taxas_c):
+    if df_p.empty:
+        return df_p
+        
+    df_m_ativos = df_m_ref[df_m_ref['Status'] == 'Ativo'] if not df_m_ref.empty else pd.DataFrame()
+
+    for idx in df_p.index:
+        row = df_p.loc[idx]
+        nome_p = str(row['Procedimento'])
+        
+        # 1. Custo Materiais
+        custo_materiais_total = 0.0
+        if not df_m_ativos.empty:
+            for _, mat in df_m_ativos.iterrows():
+                vincs = [x.strip() for x in str(mat['Procedimentos_Vinculados']).split(',')]
+                if nome_p in vincs or "Geral" in vincs:
+                    custo_materiais_total += float(mat['Custo_Por_Paciente'])
+
+        # 2. Consultas e Aluguel
+        try:
+            qtd_consultas = int(row['Qtd_Consultas'])
+        except Exception:
+            qtd_consultas = 1
+        if qtd_consultas < 1:
+            qtd_consultas = 1
+
+        custo_aluguel_total = qtd_consultas * aluguel_cons
+        custo_base = custo_materiais_total + custo_aluguel_total
+
+        # 3. Lucro (Percentual Geral, Percentual Específico ou Valor Fixo)
+        tipo_lucro = str(row.get('Tipo_Lucro', 'Percentual Geral'))
+        try:
+            val_lucro_input = float(row.get('Lucro_Valor', 0.0))
+        except Exception:
+            val_lucro_input = 0.0
+
+        if tipo_lucro == "Percentual Geral":
+            valor_lucro = custo_base * (lucro_g / 100.0)
+        elif tipo_lucro == "Percentual Específico":
+            valor_lucro = custo_base * (val_lucro_input / 100.0)
+        else:  # Valor Fixo
+            valor_lucro = val_lucro_input
+
+        # 4. Imposto e PIX
+        subtotal = custo_base + valor_lucro
+        valor_imposto = subtotal * (imposto_g / 100.0)
+        total_pix = subtotal + valor_imposto
+
+        # 5. Parcelamento e Cartão
+        parc_str = str(row.get('Parcelas', '1x'))
+        try:
+            parcelas_sel = int(re.sub(r'\D', '', parc_str))
+        except Exception:
+            parcelas_sel = 1
+        if parcelas_sel < 1: parcelas_sel = 1
+        if parcelas_sel > 12: parcelas_sel = 12
+
+        taxa_cartao_pct = taxas_c.get(parcelas_sel, 3.0)
+        total_cartao = total_pix / (1 - (taxa_cartao_pct / 100.0)) if taxa_cartao_pct < 100 else total_pix
+        custo_cartao = total_cartao - total_pix
+
+        # Atualiza os valores calculados
+        df_p.loc[idx, 'Custo_Materiais'] = round(custo_materiais_total, 2)
+        df_p.loc[idx, 'Qtd_Consultas'] = qtd_consultas
+        df_p.loc[idx, 'Custo_Aluguel'] = round(custo_aluguel_total, 2)
+        df_p.loc[idx, 'Tipo_Lucro'] = tipo_lucro
+        df_p.loc[idx, 'Lucro_Valor'] = round(valor_lucro, 2)
+        df_p.loc[idx, 'Imposto_Valor'] = round(valor_imposto, 2)
+        df_p.loc[idx, 'Parcelas'] = f"{parcelas_sel}x"
+        df_p.loc[idx, 'Taxa_Cartao_Pct'] = f"{taxa_cartao_pct}%"
+        df_p.loc[idx, 'Custo_Cartao'] = round(custo_cartao, 2)
+        df_p.loc[idx, 'Total_PIX'] = round(total_pix, 2)
+        df_p.loc[idx, 'Total_Cartao'] = round(total_cartao, 2)
+
+    return df_p
 
 # DECLARAÇÃO DE TODAS AS ABAS
 tab_resumo, tab_mat, tab_proc, tab_ag, tab_pac, tab_caixa, tab_cfg, tab_trash = st.tabs([
@@ -375,7 +460,12 @@ with tab_mat:
                 }
                 df_mat = pd.concat([df_mat, pd.DataFrame([novo_reg])], ignore_index=True)
                 write_data("Materiais", df_mat)
-                st.success("Material cadastrado!")
+
+                # Sincroniza e recalcula os procedimentos afetados
+                df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
+                write_data("Procedimentos", df_proc_ref)
+
+                st.success("Material cadastrado e procedimentos recalculados!")
                 st.rerun()
 
     st.markdown("---")
@@ -394,7 +484,12 @@ with tab_mat:
                     row['Material'], row['Preco_Compra'], row['Procedimentos_Vinculados'], row['Rendimento_Pacientes'], row['Custo_Por_Paciente']
                 ]
             write_data("Materiais", df_mat)
-            st.success("Alterações salvas!")
+            
+            # Recalcula a precificação de procedimentos após alteração de material
+            df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
+            write_data("Procedimentos", df_proc_ref)
+
+            st.success("Alterações salvas e procedimentos recalculados!")
             st.rerun()
 
         st.markdown("---")
@@ -431,44 +526,19 @@ with tab_proc:
             parcelas_sel = c2.selectbox("Parcelamento Cartão", options=list(range(1, 13)), format_func=lambda x: f"{x}x")
             
             if st.form_submit_button("Calcular e Salvar Procedimento"):
-                custo_materiais_total = 0.0
-                if not df_mat_ref.empty:
-                    df_m_ativos = df_mat_ref[df_mat_ref['Status'] == 'Ativo']
-                    for _, mat in df_m_ativos.iterrows():
-                        vincs = [x.strip() for x in str(mat['Procedimentos_Vinculados']).split(',')]
-                        if nome_p in vincs or "Geral" in vincs:
-                            custo_materiais_total += float(mat['Custo_Por_Paciente'])
-
-                custo_aluguel_total = qtd_consultas * aluguel_consulta
-                custo_base = custo_materiais_total + custo_aluguel_total
-
-                if tipo_lucro == "Percentual Geral":
-                    valor_lucro = custo_base * (lucro_geral / 100.0)
-                elif tipo_lucro == "Percentual Específico":
-                    valor_lucro = custo_base * (val_lucro_input / 100.0)
-                else:
-                    valor_lucro = val_lucro_input
-
-                subtotal = custo_base + valor_lucro
-                valor_imposto = subtotal * (imposto_pct / 100.0)
-                total_pix = subtotal + valor_imposto
-
-                taxa_cartao_pct = taxas_cartao.get(parcelas_sel, 3.0)
-                total_cartao = total_pix / (1 - (taxa_cartao_pct / 100.0))
-                custo_cartao = total_cartao - total_pix
-
                 novo_id = len(df_proc) + 1
                 novo_p = {
-                    'ID': novo_id, 'Procedimento': nome_p, 'Custo_Materiais': round(custo_materiais_total, 2),
-                    'Qtd_Consultas': qtd_consultas, 'Custo_Aluguel': round(custo_aluguel_total, 2),
-                    'Tipo_Lucro': tipo_lucro, 'Lucro_Valor': round(valor_lucro, 2),
-                    'Imposto_Valor': round(valor_imposto, 2), 'Parcelas': f"{parcelas_sel}x",
-                    'Taxa_Cartao_Pct': f"{taxa_cartao_pct}%", 'Custo_Cartao': round(custo_cartao, 2),
-                    'Total_PIX': round(total_pix, 2), 'Total_Cartao': round(total_cartao, 2), 'Status': 'Ativo'
+                    'ID': novo_id, 'Procedimento': nome_p, 'Custo_Materiais': 0.0,
+                    'Qtd_Consultas': qtd_consultas, 'Custo_Aluguel': 0.0,
+                    'Tipo_Lucro': tipo_lucro, 'Lucro_Valor': round(val_lucro_input, 2),
+                    'Imposto_Valor': 0.0, 'Parcelas': f"{parcelas_sel}x",
+                    'Taxa_Cartao_Pct': '0%', 'Custo_Cartao': 0.0,
+                    'Total_PIX': 0.0, 'Total_Cartao': 0.0, 'Status': 'Ativo'
                 }
                 df_proc = pd.concat([df_proc, pd.DataFrame([novo_p])], ignore_index=True)
+                df_proc = recalcular_procedimentos_df(df_proc, df_mat_ref, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
                 write_data("Procedimentos", df_proc)
-                st.success("Procedimento gravado!")
+                st.success("Procedimento cadastrado e calculado!")
                 st.rerun()
 
     st.markdown("---")
@@ -479,15 +549,37 @@ with tab_proc:
         df_p_disp = df_proc_active[df_proc_active['Procedimento'].str.contains(busca_p, case=False, na=False)] if busca_p else df_proc_active
         col_dp.download_button("📊 Baixar Excel", data=export_to_excel(df_p_disp), file_name="procedimentos.xlsx", use_container_width=True)
 
-        edited_proc = st.data_editor(df_p_disp.drop(columns=['Status'], errors='ignore'), use_container_width=True, key="editor_proc")
-        if st.button("💾 Salvar Alterações na Planilha (Procedimentos)"):
+        edited_proc = st.data_editor(
+            df_p_disp.drop(columns=['Status'], errors='ignore'),
+            column_config={
+                "Tipo_Lucro": st.column_config.SelectboxColumn(
+                    "Tipo de Lucro",
+                    options=["Percentual Geral", "Percentual Específico", "Valor Fixo"],
+                    required=True
+                ),
+                "Lucro_Valor": st.column_config.NumberColumn(
+                    "Lucro (Valor em R$ ou %)",
+                    help="Se Percentual Específico coloque a %. Se Valor Fixo coloque o R$."
+                )
+            },
+            use_container_width=True,
+            key="editor_proc"
+        )
+
+        if st.button("💾 Salvar Alterações e Recalcular Preços"):
             for idx, row in edited_proc.iterrows():
                 p_id = row['ID']
-                df_proc.loc[df_proc['ID'] == p_id, ['Procedimento', 'Qtd_Consultas', 'Total_PIX', 'Total_Cartao', 'Parcelas']] = [
-                    row['Procedimento'], row['Qtd_Consultas'], row['Total_PIX'], row['Total_Cartao'], row['Parcelas']
-                ]
+                mask = df_proc['ID'] == p_id
+                df_proc.loc[mask, 'Procedimento'] = row['Procedimento']
+                df_proc.loc[mask, 'Qtd_Consultas'] = row['Qtd_Consultas']
+                df_proc.loc[mask, 'Tipo_Lucro'] = row['Tipo_Lucro']
+                df_proc.loc[mask, 'Lucro_Valor'] = row['Lucro_Valor']
+                df_proc.loc[mask, 'Parcelas'] = row['Parcelas']
+
+            # RODA O RECÁLCULO COMPLETO MATEMÁTICO
+            df_proc = recalcular_procedimentos_df(df_proc, df_mat_ref, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
             write_data("Procedimentos", df_proc)
-            st.success("Salvo!")
+            st.success("Alterações salvas e precificação recalculada com sucesso!")
             st.rerun()
 
         st.markdown("---")
@@ -880,7 +972,14 @@ with tab_cfg:
                 novas_configs.append({'Chave': f'taxa_{i}x', 'Valor': novas_taxas[i]})
 
             write_data("Configuracoes", pd.DataFrame(novas_configs))
-            st.success("Configurações salvas!")
+            
+            # Recalcula todos os procedimentos com as novas regras globais
+            df_proc_ref = read_data("Procedimentos", PROC_COLS)
+            df_mat_ref = read_data("Materiais", MAT_COLS)
+            df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat_ref, novo_aluguel, novo_imposto, novo_lucro, novas_taxas)
+            write_data("Procedimentos", df_proc_ref)
+
+            st.success("Configurações salvas e precificações atualizadas!")
             st.rerun()
 
 # ------------------------------------------
@@ -918,3 +1017,4 @@ with tab_trash:
                 write_data(cat_del, df_t)
                 st.success("Item restaurado!")
                 st.rerun()
+
