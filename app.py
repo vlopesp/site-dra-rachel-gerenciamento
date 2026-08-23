@@ -4,8 +4,8 @@ import hashlib
 import io
 import os
 import base64
-from datetime import datetime
-from difflib import SequenceMatcher
+import calendar
+from datetime import datetime, timedelta, time
 from streamlit_gsheets import GSheetsConnection
 
 # ==========================================
@@ -21,32 +21,27 @@ ROSE_PRIMARY = "#d19496"
 ROSE_SECONDARY = "#e8b9b3"
 DARK_TEXT = "#2d2324"
 
-# Injeção de CSS para garantir visibilidade no Tema Escuro e aplicar a identidade da marca
 st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Allura&family=Comfortaa:wght@400;600;700&display=swap');
 
-    /* Força fundo claro e texto legível em qualquer tema */
     .stApp {{
         background-color: #fdfbfb !important;
         color: {DARK_TEXT} !important;
     }}
     
-    /* Corrige textos que somem no tema escuro */
     p, span, label, h1, h2, h3, h4, h5, h6, div, td, th {{
         color: {DARK_TEXT} !important;
         font-family: 'Comfortaa', cursive, sans-serif;
     }}
 
-    /* Inputs e Seletores */
-    .stTextInput input, .stNumberInput input, .stSelectbox div, .stDateInput input, .stTimeInput input {{
+    .stTextInput input, .stNumberInput input, .stSelectbox div, .stDateInput input, .stTimeInput input, .stTextArea textarea {{
         background-color: #ffffff !important;
         color: {DARK_TEXT} !important;
         border: 1px solid {ROSE_PRIMARY} !important;
         border-radius: 6px !important;
     }}
     
-    /* Botões estilizados em Rosé */
     .stButton > button {{
         background-color: {ROSE_PRIMARY} !important;
         color: #ffffff !important;
@@ -64,7 +59,6 @@ st.markdown(f"""
         background-color: {ROSE_SECONDARY} !important;
     }}
     
-    /* Abas estilizadas */
     .stTabs [data-baseweb="tab-list"] {{
         gap: 6px;
     }}
@@ -83,7 +77,6 @@ st.markdown(f"""
         color: #ffffff !important;
     }}
 
-    /* Cards da Agenda */
     .agenda-card {{
         background-color: #ffffff;
         border-left: 5px solid {ROSE_PRIMARY};
@@ -92,10 +85,18 @@ st.markdown(f"""
         margin-bottom: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }}
+
+    .cal-header {{
+        text-align: center;
+        font-weight: bold;
+        background-color: #f5e8e8;
+        padding: 5px;
+        border-radius: 4px;
+        margin-bottom: 5px;
+    }}
     </style>
 """, unsafe_allow_html=True)
 
-# Function para exibir o Logo da Dra. Rachel com renderização em Alta Definição (Base64)
 def render_logo(width=300, center=True):
     if os.path.exists("logo.png"):
         with open("logo.png", "rb") as image_file:
@@ -132,6 +133,9 @@ def read_data(worksheet_name, default_columns):
         df = conn.read(worksheet=worksheet_name, ttl=2)
         if df is None or df.empty:
             return pd.DataFrame(columns=default_columns)
+        for col in default_columns:
+            if col not in df.columns:
+                df[col] = ""
         return df
     except Exception:
         return pd.DataFrame(columns=default_columns)
@@ -140,7 +144,7 @@ def write_data(worksheet_name, df):
     conn.update(worksheet=worksheet_name, data=df)
 
 # ==========================================
-# 3. AUTENTICAÇÃO SEGURA (HASH SHA-256)
+# 3. AUTENTICAÇÃO SEGURA
 # ==========================================
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -200,10 +204,7 @@ def export_to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Dados')
     return output.getvalue()
 
-def similarity(a, b):
-    return SequenceMatcher(None, str(a).lower().strip(), str(b).lower().strip()).ratio()
-
-# CARREGAR CONFIGURAÇÕES PERMANENTES
+# CONFIGURAÇÕES PERMANENTES
 CFG_COLS = ['Chave', 'Valor']
 df_cfg = read_data("Configuracoes", CFG_COLS)
 
@@ -218,29 +219,87 @@ def get_cfg_val(chave, valor_padrao):
 aluguel_consulta = get_cfg_val('aluguel_consulta', 60.0)
 imposto_geral = get_cfg_val('imposto_geral', 6.0)
 lucro_geral = get_cfg_val('lucro_geral', 40.0)
-taxas_cartao = {
-    1: get_cfg_val('taxa_1x', 2.5),
-    2: get_cfg_val('taxa_2x', 4.0),
-    3: get_cfg_val('taxa_3x', 5.5),
-    6: get_cfg_val('taxa_6x', 8.0),
-    12: get_cfg_val('taxa_12x', 12.0)
-}
 
-# ABAS DO PROGRAMA
-tab_mat, tab_proc, tab_ag, tab_pac, tab_cfg, tab_trash = st.tabs([
-    "📦 1. Materiais", "⚖️ 2. Precificação", "📅 3. Agenda (Calendário)",
-    "👥 4. Pacientes", "⚙️ 5. Configurações & Taxas", "🗑️ 6. Lixeira / Segurança"
+# Taxas do cartão de 1x até 12x
+taxas_cartao = {i: get_cfg_val(f'taxa_{i}x', round(2.0 + (i * 0.8), 2)) for i in range(1, 13)}
+
+# ESTRUTURA DE ABAS
+tab_resumo, tab_mat, tab_proc, tab_ag, tab_pac, tab_caixa, tab_cfg, tab_trash = st.tabs([
+    "📊 1. Resumo", "📦 2. Materiais", "⚖️ 3. Precificação", "📅 4. Agenda & Prontuário",
+    "👥 5. Pacientes", "💵 6. Livro Caixa", "⚙️ 7. Configurações", "🗑️ 8. Lixeira"
 ])
 
-# ------------------------------------------
-# TAB 1: MATERIAIS
-# ------------------------------------------
+# COLS DE BANCO DE DADOS
 MAT_COLS = ['ID', 'Material', 'Preco_Compra', 'Procedimentos_Vinculados', 'Rendimento_Pacientes', 'Custo_Por_Paciente', 'Status']
+PROC_COLS = ['ID', 'Procedimento', 'Custo_Materiais', 'Qtd_Consultas', 'Custo_Aluguel', 'Tipo_Lucro', 'Lucro_Valor', 'Imposto_Valor', 'Parcelas', 'Taxa_Cartao_Pct', 'Custo_Cartao', 'Total_PIX', 'Total_Cartao', 'Status']
+AG_COLS = ['ID', 'Data', 'Horario_Inicio', 'Duracao_Min', 'Horario_Fim', 'Paciente', 'Telefone', 'Email', 'Procedimento', 'Status_Atendimento', 'Anotacoes_Clinicas', 'Status']
+PAC_COLS = ['ID', 'Paciente', 'Telefone', 'Email', 'Historico_Procedimentos', 'Ultima_Ida', 'Recorrencia', 'Status']
+CAIXA_COLS = ['ID', 'Data', 'Tipo', 'Categoria', 'Descricao', 'Valor', 'Forma_Pagamento', 'Status']
 
+# ------------------------------------------
+# TAB 1: RESUMO / DASHBOARD
+# ------------------------------------------
+with tab_resumo:
+    st.subheader("📊 Painel de Resumo Mensal")
+    df_ag = read_data("Agenda", AG_COLS)
+    df_ag_active = df_ag[df_ag['Status'] == 'Ativo'] if not df_ag.empty else pd.DataFrame()
+
+    c_m1, c_m2 = st.columns(2)
+    mes_nomes = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+    mes_resumo = c_m1.selectbox("Mês de Análise", options=range(1, 13), format_func=lambda x: mes_nomes[x-1], index=datetime.now().month - 1)
+    ano_resumo = c_m2.number_input("Ano de Análise", min_value=2024, max_value=2030, value=datetime.now().year)
+
+    df_mes = pd.DataFrame()
+    total_pac_mes = 0
+    total_concluidos = 0
+    total_marcados = 0
+
+    if not df_ag_active.empty:
+        df_ag_active['dt_obj'] = pd.to_datetime(df_ag_active['Data'], format='%d/%m/%Y', errors='coerce')
+        df_mes = df_ag_active[(df_ag_active['dt_obj'].dt.month == mes_resumo) & (df_ag_active['dt_obj'].dt.year == ano_resumo)]
+        
+        total_pac_mes = len(df_mes)
+        total_concluidos = len(df_mes[df_mes['Status_Atendimento'] == 'Concluído'])
+        total_marcados = len(df_mes[df_mes['Status_Atendimento'] != 'Concluído'])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("👥 Total Pacientes no Mês", total_pac_mes)
+    m2.metric("✅ Consultas Concluídas", total_concluidos)
+    m3.metric("📅 Pacientes Marcados/Pendentes", total_marcados)
+
+    st.markdown("---")
+    st.write("### 📆 Distribuição Diária de Pacientes")
+    
+    if df_mes.empty:
+        st.info("Nenhum agendamento registrado para este mês.")
+    else:
+        # Tabela com resumo diário
+        dias_mes = df_mes['Data'].unique()
+        resumo_diario = []
+        for d in sorted(dias_mes):
+            sub = df_mes[df_mes['Data'] == d]
+            conc = len(sub[sub['Status_Atendimento'] == 'Concluído'])
+            marc = len(sub[sub['Status_Atendimento'] != 'Concluído'])
+            resumo_diario.append({
+                'Data': d,
+                'Total Pacientes': len(sub),
+                '🟢 Concluídos': conc,
+                '🟠 Marcados': marc
+            })
+        st.dataframe(pd.DataFrame(resumo_diario), use_container_width=True)
+
+    st.markdown("---")
+    st.write("### 📋 Resumo da Agenda Recente / Próximos Atendimentos")
+    if not df_ag_active.empty:
+        st.dataframe(df_ag_active[['Data', 'Horario_Inicio', 'Paciente', 'Procedimento', 'Status_Atendimento']].tail(10), use_container_width=True)
+
+# ------------------------------------------
+# TAB 2: MATERIAIS
+# ------------------------------------------
 with tab_mat:
-    st.subheader("Cadastro e Custo de Materiais")
+    st.subheader("📦 Cadastro e Custo de Materiais")
     df_mat = read_data("Materiais", MAT_COLS)
-    df_proc_ref = read_data("Procedimentos", ['Procedimento', 'Status'])
+    df_proc_ref = read_data("Procedimentos", PROC_COLS)
     procs_validos = df_proc_ref[df_proc_ref['Status'] == 'Ativo']['Procedimento'].tolist() if not df_proc_ref.empty else []
     
     with st.expander("➕ Cadastrar Novo Material", expanded=False):
@@ -255,13 +314,10 @@ with tab_mat:
                 custo_p_paciente = preco_c / rendimento
                 novo_id = len(df_mat) + 1
                 novo_reg = {
-                    'ID': novo_id,
-                    'Material': nome_m,
-                    'Preco_Compra': preco_c,
+                    'ID': novo_id, 'Material': nome_m, 'Preco_Compra': preco_c,
                     'Procedimentos_Vinculados': ", ".join(procs_sel),
                     'Rendimento_Pacientes': rendimento,
-                    'Custo_Por_Paciente': round(custo_p_paciente, 2),
-                    'Status': 'Ativo'
+                    'Custo_Por_Paciente': round(custo_p_paciente, 2), 'Status': 'Ativo'
                 }
                 df_mat = pd.concat([df_mat, pd.DataFrame([novo_reg])], ignore_index=True)
                 write_data("Materiais", df_mat)
@@ -269,22 +325,14 @@ with tab_mat:
                 st.rerun()
 
     st.markdown("---")
-    df_mat_active = df_mat[df_mat['Status'] == 'Ativo'] if not df_mat.empty else df_mat
-    
+    df_mat_active = df_mat[df_mat['Status'] == 'Ativo'] if not df_mat.empty else pd.DataFrame()
     if not df_mat_active.empty:
         col_f, col_d = st.columns([3, 1])
         busca_m = col_f.text_input("🔍 Filtrar Materiais:", placeholder="Digite o nome do material...")
-        
-        if busca_m:
-            df_display = df_mat_active[df_mat_active['Material'].str.contains(busca_m, case=False, na=False)]
-        else:
-            df_display = df_mat_active
-
+        df_display = df_mat_active[df_mat_active['Material'].str.contains(busca_m, case=False, na=False)] if busca_m else df_mat_active
         col_d.download_button("📊 Baixar Excel", data=export_to_excel(df_display), file_name="materiais.xlsx", use_container_width=True)
 
-        st.info("💡 Você pode editar as células diretamente abaixo e clicar em **Salvar Alterações**.")
         edited_mat = st.data_editor(df_display.drop(columns=['Status'], errors='ignore'), use_container_width=True, key="editor_mat")
-
         if st.button("💾 Salvar Alterações na Planilha (Materiais)"):
             for idx, row in edited_mat.iterrows():
                 mat_id = row['ID']
@@ -292,29 +340,23 @@ with tab_mat:
                     row['Material'], row['Preco_Compra'], row['Procedimentos_Vinculados'], row['Rendimento_Pacientes'], row['Custo_Por_Paciente']
                 ]
             write_data("Materiais", df_mat)
-            st.success("Alterações salvas no Google Sheets!")
+            st.success("Alterações salvas!")
             st.rerun()
 
         st.markdown("---")
         c_del1, c_del2 = st.columns([3, 1])
-        mat_del = c_del1.selectbox("Remover Material:", options=df_mat_active['Material'].tolist())
-        if c_del2.button("🗑️ Mover para Lixeira"):
+        mat_del = c_del1.selectbox("Remover Material:", options=df_mat_active['Material'].tolist(), key="sel_del_mat")
+        if c_del2.button("🗑️ Mover Material para Lixeira"):
             df_mat.loc[df_mat['Material'] == mat_del, 'Status'] = 'Excluido'
             write_data("Materiais", df_mat)
             st.warning("Material movido para a lixeira!")
             st.rerun()
 
 # ------------------------------------------
-# TAB 2: PROCEDIMENTOS & PRECIFICAÇÃO
+# TAB 3: PROCEDIMENTOS & PRECIFICAÇÃO
 # ------------------------------------------
-PROC_COLS = [
-    'ID', 'Procedimento', 'Custo_Materiais', 'Qtd_Consultas', 'Custo_Aluguel',
-    'Tipo_Lucro', 'Lucro_Valor', 'Imposto_Valor', 'Parcelas', 'Taxa_Cartao_Pct',
-    'Custo_Cartao', 'Total_PIX', 'Total_Cartao', 'Status'
-]
-
 with tab_proc:
-    st.subheader("Cálculo e Precificação de Procedimentos")
+    st.subheader("⚖️ Cálculo e Precificação de Procedimentos")
     df_proc = read_data("Procedimentos", PROC_COLS)
     df_mat_ref = read_data("Materiais", MAT_COLS)
     
@@ -332,9 +374,9 @@ with tab_proc:
                 val_lucro_input = c3.number_input("Lucro Fixo (R$)", min_value=0.0, value=150.0)
                 
             imposto_pct = c1.number_input("Imposto (%)", value=imposto_geral)
-            parcelas_sel = c2.selectbox("Parcelamento Cartão", options=[1, 2, 3, 6, 12])
+            parcelas_sel = c2.selectbox("Parcelamento Cartão", options=list(range(1, 13)), format_func=lambda x: f"{x}x")
             
-            if st.form_submit_button("Calcular e Salvar"):
+            if st.form_submit_button("Calcular e Salvar Procedimento"):
                 custo_materiais_total = 0.0
                 if not df_mat_ref.empty:
                     df_m_ativos = df_mat_ref[df_mat_ref['Status'] == 'Ativo']
@@ -376,177 +418,400 @@ with tab_proc:
                 st.rerun()
 
     st.markdown("---")
-    df_proc_active = df_proc[df_proc['Status'] == 'Ativo'] if not df_proc.empty else df_proc
-
+    df_proc_active = df_proc[df_proc['Status'] == 'Ativo'] if not df_proc.empty else pd.DataFrame()
     if not df_proc_active.empty:
         col_fp, col_dp = st.columns([3, 1])
         busca_p = col_fp.text_input("🔍 Filtrar Procedimentos:", placeholder="Digite o nome do procedimento...")
-        
         df_p_disp = df_proc_active[df_proc_active['Procedimento'].str.contains(busca_p, case=False, na=False)] if busca_p else df_proc_active
         col_dp.download_button("📊 Baixar Excel", data=export_to_excel(df_p_disp), file_name="procedimentos.xlsx", use_container_width=True)
 
         edited_proc = st.data_editor(df_p_disp.drop(columns=['Status'], errors='ignore'), use_container_width=True, key="editor_proc")
-
         if st.button("💾 Salvar Alterações na Planilha (Procedimentos)"):
             for idx, row in edited_proc.iterrows():
                 p_id = row['ID']
-                df_proc.loc[df_proc['ID'] == p_id, ['Procedimento', 'Qtd_Consultas', 'Total_PIX', 'Total_Cartao']] = [
-                    row['Procedimento'], row['Qtd_Consultas'], row['Total_PIX'], row['Total_Cartao']
+                df_proc.loc[df_proc['ID'] == p_id, ['Procedimento', 'Qtd_Consultas', 'Total_PIX', 'Total_Cartao', 'Parcelas']] = [
+                    row['Procedimento'], row['Qtd_Consultas'], row['Total_PIX'], row['Total_Cartao'], row['Parcelas']
                 ]
             write_data("Procedimentos", df_proc)
-            st.success("Salvo no Google Sheets!")
+            st.success("Salvo!")
+            st.rerun()
+
+        st.markdown("---")
+        cp_del1, cp_del2 = st.columns([3, 1])
+        proc_del = cp_del1.selectbox("Remover Procedimento:", options=df_proc_active['Procedimento'].tolist(), key="sel_del_proc")
+        if cp_del2.button("🗑️ Mover Procedimento para Lixeira"):
+            df_proc.loc[df_proc['Procedimento'] == proc_del, 'Status'] = 'Excluido'
+            write_data("Procedimentos", df_proc)
+            st.warning("Procedimento movido para a lixeira!")
             st.rerun()
 
 # ------------------------------------------
-# TAB 3: AGENDA (CALENDÁRIO VISUAL)
+# TAB 4: AGENDA & PRONTUÁRIO
 # ------------------------------------------
-AG_COLS = ['ID', 'Data', 'Horario', 'Paciente', 'Telefone', 'Email', 'Procedimento', 'Status']
-PAC_COLS = ['ID', 'Paciente', 'Telefone', 'Email', 'Historico_Procedimentos', 'Ultima_Ida', 'Recorrencia', 'Status']
+def salvar_agendamento(novo_reg, df_ag, df_pac):
+    df_ag = pd.concat([df_ag, pd.DataFrame([novo_reg])], ignore_index=True)
+    write_data("Agenda", df_ag)
+
+    data_str = novo_reg['Data']
+    nome_pac = novo_reg['Paciente']
+    proc_ag = novo_reg['Procedimento']
+    tel_pac = novo_reg['Telefone']
+    email_pac = novo_reg['Email']
+
+    novo_item_hist = f"[{data_str}] {proc_ag} (Agendado)"
+    if not df_pac.empty and nome_pac in df_pac['Paciente'].values:
+        idx = df_pac[df_pac['Paciente'] == nome_pac].index[0]
+        hist_atual = str(df_pac.loc[idx, 'Historico_Procedimentos'])
+        df_pac.loc[idx, 'Historico_Procedimentos'] = hist_atual + " | " + novo_item_hist
+        df_pac.loc[idx, 'Ultima_Ida'] = data_str
+        try:
+            df_pac.loc[idx, 'Recorrencia'] = int(df_pac.loc[idx, 'Recorrencia']) + 1
+        except Exception:
+            df_pac.loc[idx, 'Recorrencia'] = 1
+    else:
+        reg_pac = {
+            'ID': len(df_pac) + 1, 'Paciente': nome_pac, 'Telefone': tel_pac,
+            'Email': email_pac, 'Historico_Procedimentos': novo_item_hist,
+            'Ultima_Ida': data_str, 'Recorrencia': 1, 'Status': 'Ativo'
+        }
+        df_pac = pd.concat([df_pac, pd.DataFrame([reg_pac])], ignore_index=True)
+
+    write_data("Pacientes", df_pac)
 
 with tab_ag:
-    st.subheader("📅 Agenda da Clínica")
+    st.subheader("📅 Agenda & Prontuário Clínico")
     df_ag = read_data("Agenda", AG_COLS)
     df_pac = read_data("Pacientes", PAC_COLS)
     df_proc_ref = read_data("Procedimentos", PROC_COLS)
     procs_disponiveis = df_proc_ref[df_proc_ref['Status'] == 'Ativo']['Procedimento'].tolist() if not df_proc_ref.empty else ["Consulta Geral"]
 
-    col_ag1, col_ag2 = st.columns([1, 2])
+    if 'agenda_date' not in st.session_state:
+        st.session_state.agenda_date = datetime.now().date()
+    if 'conflito_pendente' not in st.session_state:
+        st.session_state.conflito_pendente = None
 
-    with col_ag1:
-        st.write("### ➕ Novo Agendamento")
-        with st.form("form_ag_cal"):
-            dt_c = st.date_input("Data*", value=datetime.now())
-            hr_c = st.time_input("Horário*", value=datetime.now().time())
+    col_ag_form, col_ag_cal = st.columns([1.1, 1.9])
+
+    with col_ag_form:
+        st.write("### ➕ Agendar Consulta")
+        with st.form("form_novo_agendamento"):
+            dt_c = st.date_input("Data da Consulta*", value=st.session_state.agenda_date)
+            c_h1, c_h2 = st.columns(2)
+            hr_inicio = c_h1.time_input("Horário de Início*", value=time(9, 0))
+            duracao = c_h2.number_input("Duração (minutos)*", min_value=10, max_value=480, value=60, step=10)
+            
+            dt_dummy = datetime.combine(datetime.today(), hr_inicio)
+            dt_fim = dt_dummy + timedelta(minutes=duracao)
+            hr_fim = dt_fim.time()
+            
+            st.caption(f"⏱️ Horário Estimado: **{hr_inicio.strftime('%H:%M')}** até **{hr_fim.strftime('%H:%M')}**")
+            
             nome_pac = st.text_input("Nome do Paciente*")
             tel_pac = st.text_input("Telefone")
             email_pac = st.text_input("E-mail")
-            proc_ag = st.selectbox("Procedimento", options=procs_disponiveis)
+            proc_ag = st.selectbox("Procedimento*", options=procs_disponiveis)
             
-            if st.form_submit_button("Agendar Consulta", use_container_width=True):
-                if nome_pac:
+            btn_sub = st.form_submit_button("Verificar & Agendar", use_container_width=True)
+
+            if btn_sub:
+                if not nome_pac:
+                    st.error("Por favor, preencha o nome do paciente.")
+                else:
                     data_str = dt_c.strftime("%d/%m/%Y")
-                    novo_id_ag = len(df_ag) + 1
-                    reg_ag = {
-                        'ID': novo_id_ag, 'Data': data_str, 'Horario': hr_c.strftime("%H:%M"),
-                        'Paciente': nome_pac, 'Telefone': tel_pac, 'Email': email_pac,
-                        'Procedimento': proc_ag, 'Status': 'Ativo'
+                    str_inc = hr_inicio.strftime("%H:%M")
+                    str_fim = hr_fim.strftime("%H:%M")
+                    
+                    df_ag_active = df_ag[df_ag['Status'] == 'Ativo'] if not df_ag.empty else pd.DataFrame()
+                    choques = []
+
+                    if not df_ag_active.empty:
+                        df_dia_check = df_ag_active[df_ag_active['Data'] == data_str]
+                        for _, item in df_dia_check.iterrows():
+                            try:
+                                ex_inc = datetime.strptime(str(item['Horario_Inicio']), "%H:%M").time()
+                            except Exception:
+                                ex_inc = time(9, 0)
+                            try:
+                                ex_dur = int(item['Duracao_Min'])
+                            except Exception:
+                                ex_dur = 60
+                            
+                            ex_dt_inc = datetime.combine(dt_c, ex_inc)
+                            ex_dt_fim = ex_dt_inc + timedelta(minutes=ex_dur)
+                            ex_fim = ex_dt_fim.time()
+
+                            new_dt_inc = datetime.combine(dt_c, hr_inicio)
+                            new_dt_fim = datetime.combine(dt_c, hr_fim)
+
+                            if new_dt_inc < ex_dt_fim and new_dt_fim > ex_dt_inc:
+                                choques.append({
+                                    'paciente': item['Paciente'],
+                                    'procedimento': item['Procedimento'],
+                                    'inicio': ex_inc.strftime("%H:%M"),
+                                    'fim': ex_fim.strftime("%H:%M")
+                                })
+
+                    novo_reg = {
+                        'ID': len(df_ag) + 1, 'Data': data_str,
+                        'Horario_Inicio': str_inc, 'Duracao_Min': duracao,
+                        'Horario_Fim': str_fim, 'Paciente': nome_pac,
+                        'Telefone': tel_pac, 'Email': email_pac,
+                        'Procedimento': proc_ag, 'Status_Atendimento': 'Marcado',
+                        'Anotacoes_Clinicas': '', 'Status': 'Ativo'
                     }
-                    df_ag = pd.concat([df_ag, pd.DataFrame([reg_ag])], ignore_index=True)
-                    write_data("Agenda", df_ag)
 
-                    # Atualização do cadastro de Pacientes
-                    novo_item_hist = f"[{data_str}] {proc_ag}"
-                    if not df_pac.empty and nome_pac in df_pac['Paciente'].values:
-                        idx = df_pac[df_pac['Paciente'] == nome_pac].index[0]
-                        hist_atual = str(df_pac.loc[idx, 'Historico_Procedimentos'])
-                        df_pac.loc[idx, 'Historico_Procedimentos'] = hist_atual + " | " + novo_item_hist
-                        df_pac.loc[idx, 'Ultima_Ida'] = data_str
-                        df_pac.loc[idx, 'Recorrencia'] = int(df_pac.loc[idx, 'Recorrencia']) + 1
-                    else:
-                        reg_pac = {
-                            'ID': len(df_pac) + 1, 'Paciente': nome_pac, 'Telefone': tel_pac,
-                            'Email': email_pac, 'Historico_Procedimentos': novo_item_hist,
-                            'Ultima_Ida': data_str, 'Recorrencia': 1, 'Status': 'Ativo'
+                    if choques:
+                        st.session_state.conflito_pendente = {
+                            'novo_reg': novo_reg,
+                            'choques': choques
                         }
-                        df_pac = pd.concat([df_pac, pd.DataFrame([reg_pac])], ignore_index=True)
+                    else:
+                        salvar_agendamento(novo_reg, df_ag, df_pac)
+                        st.session_state.agenda_date = dt_c
+                        st.success("Agendado com sucesso!")
+                        st.rerun()
 
-                    write_data("Pacientes", df_pac)
-                    st.success("Agendado!")
-                    st.rerun()
+        if st.session_state.conflito_pendente:
+            conf = st.session_state.conflito_pendente
+            st.error("⚠️ **AVISO DE CHOQUE DE HORÁRIO!**")
+            for ch in conf['choques']:
+                st.warning(f"O(A) paciente **{ch['paciente']}** já está marcado(a) para **{ch['procedimento']}** das **{ch['inicio']}** às **{ch['fim']}**.")
+            
+            c_b1, c_b2, c_b3 = st.columns(3)
+            if c_b1.button("❌ Cancelar"):
+                st.session_state.conflito_pendente = None
+                st.rerun()
+            if c_b2.button("✏️ Ajustar"):
+                st.session_state.conflito_pendente = None
+            if c_b3.button("⚠️ Marcar mesmo assim"):
+                salvar_agendamento(conf['novo_reg'], df_ag, df_pac)
+                st.session_state.conflito_pendente = None
+                st.success("Agendado!")
+                st.rerun()
 
-    with col_ag2:
-        st.write("### 📆 Visualização Diária")
-        data_filtro = st.date_input("Escolha a data para ver os compromissos:", value=datetime.now())
-        data_filtro_str = data_filtro.strftime("%d/%m/%Y")
+    with col_ag_cal:
+        st.write("### 📆 Calendário do Mês")
+        c_m1, c_m2 = st.columns(2)
+        mes_sel = c_m1.selectbox("Mês", options=range(1, 13), format_func=lambda x: mes_nomes[x-1], index=st.session_state.agenda_date.month - 1, key="ag_m")
+        ano_sel = c_m2.number_input("Ano", min_value=2024, max_value=2030, value=st.session_state.agenda_date.year, key="ag_a")
 
-        df_ag_active = df_ag[df_ag['Status'] == 'Ativo'] if not df_ag.empty else df_ag
-        df_dia = df_ag_active[df_ag_active['Data'] == data_filtro_str] if not df_ag_active.empty else pd.DataFrame()
+        df_ag_active = df_ag[df_ag['Status'] == 'Ativo'] if not df_ag.empty else pd.DataFrame()
+        contagem_dias = {}
+
+        if not df_ag_active.empty:
+            for _, row in df_ag_active.iterrows():
+                try:
+                    dt_obj = datetime.strptime(str(row['Data']), "%d/%m/%Y").date()
+                    if dt_obj.month == mes_sel and dt_obj.year == ano_sel:
+                        contagem_dias[dt_obj.day] = contagem_dias.get(dt_obj.day, 0) + 1
+                except Exception:
+                    pass
+
+        cal = calendar.monthcalendar(ano_sel, mes_sel)
+        dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+        
+        cols_hdr = st.columns(7)
+        for idx, d_nome in enumerate(dias_semana):
+            cols_hdr[idx].markdown(f"<div class='cal-header'>{d_nome}</div>", unsafe_allow_html=True)
+
+        for semana in cal:
+            cols_dia = st.columns(7)
+            for idx, dia in enumerate(semana):
+                if dia == 0:
+                    cols_dia[idx].write("")
+                else:
+                    n_pacientes = contagem_dias.get(dia, 0)
+                    badge = f"({n_pacientes} pac)" if n_pacientes > 0 else "•"
+                    dt_btn = datetime(ano_sel, mes_sel, dia).date()
+                    is_selected = (dt_btn == st.session_state.agenda_date)
+                    label_btn = f"{'📍' if is_selected else ''}{dia}\n{badge}"
+                    
+                    if cols_dia[idx].button(label_btn, key=f"cal_btn_{ano_sel}_{mes_sel}_{dia}", use_container_width=True):
+                        st.session_state.agenda_date = dt_btn
+                        st.rerun()
+
+        st.markdown("---")
+        data_sel_str = st.session_state.agenda_date.strftime("%d/%m/%Y")
+        st.write(f"### 📋 Atendimentos para **{data_sel_str}**")
+
+        df_dia = df_ag_active[df_ag_active['Data'] == data_sel_str] if not df_ag_active.empty else pd.DataFrame()
 
         if df_dia.empty:
-            st.info(f"Nenhuma consulta agendada para o dia {data_filtro_str}.")
+            st.info(f"Nenhum paciente agendado para {data_sel_str}.")
         else:
-            for _, ag_item in df_dia.sort_values(by='Horario').iterrows():
+            for idx_row, ag_item in df_dia.iterrows():
+                inc = ag_item.get('Horario_Inicio', '09:00')
+                fim = ag_item.get('Horario_Fim', '10:00')
+                st_atend = ag_item.get('Status_Atendimento', 'Marcado')
+                color_tag = "green" if st_atend == "Concluído" else ROSE_PRIMARY
+
                 st.markdown(f"""
-                    <div class="agenda-card">
-                        <strong style="color: {ROSE_PRIMARY}; font-size: 16px;">⏰ {ag_item['Horario']} - {ag_item['Paciente']}</strong><br/>
-                        <b>Procedimento:</b> {ag_item['Procedimento']} | <b>Telefone:</b> {ag_item['Telefone']}
+                    <div class="agenda-card" style="border-left-color: {color_tag};">
+                        <strong style="color: {color_tag}; font-size: 16px;">⏰ {inc} às {fim} - {ag_item['Paciente']} [{st_atend}]</strong><br/>
+                        <b>Procedimento:</b> {ag_item['Procedimento']} | <b>Telefone:</b> {ag_item.get('Telefone', 'N/A')}
                     </div>
                 """, unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.write("### 📋 Todas as Consultas")
-        st.dataframe(df_ag_active.drop(columns=['Status'], errors='ignore'), use_container_width=True)
+                # EXPANDER PARA EVOLUÇÃO / PRONTUÁRIO MÉDICO
+                with st.expander(f"📝 Atender / Prontuário de {ag_item['Paciente']}"):
+                    anot_atual = str(ag_item.get('Anotacoes_Clinicas', ''))
+                    if anot_atual == 'nan':
+                        anot_atual = ""
+                    
+                    nova_anot = st.text_area("O que aconteceu na consulta (Evolução / Observações):", value=anot_atual, key=f"anot_{ag_item['ID']}")
+                    c_status, c_save = st.columns([1, 1])
+                    novo_status_atend = c_status.selectbox("Status da Consulta:", ["Marcado", "Concluído", "Cancelado"], index=1 if st_atend == "Concluído" else 0, key=f"st_{ag_item['ID']}")
+                    
+                    if c_save.button("💾 Salvar Prontuário & Historico", key=f"btn_save_pront_{ag_item['ID']}"):
+                        # Atualiza na Agenda
+                        df_ag.loc[df_ag['ID'] == ag_item['ID'], 'Anotacoes_Clinicas'] = nova_anot
+                        df_ag.loc[df_ag['ID'] == ag_item['ID'], 'Status_Atendimento'] = novo_status_atend
+                        write_data("Agenda", df_ag)
+
+                        # Atualiza e preserva o histórico do Paciente
+                        p_nome = ag_item['Paciente']
+                        if not df_pac.empty and p_nome in df_pac['Paciente'].values:
+                            p_idx = df_pac[df_pac['Paciente'] == p_nome].index[0]
+                            hist_antigo = str(df_pac.loc[p_idx, 'Historico_Procedimentos'])
+                            registro_prontuario = f"[{data_sel_str}] {ag_item['Procedimento']}: {nova_anot}"
+                            
+                            if registro_prontuario not in hist_antigo:
+                                df_pac.loc[p_idx, 'Historico_Procedimentos'] = hist_antigo + " | " + registro_prontuario
+                                write_data("Pacientes", df_pac)
+
+                        st.success("Prontuário salvo no histórico do paciente!")
+                        st.rerun()
 
 # ------------------------------------------
-# TAB 4: PACIENTES
+# TAB 5: PACIENTES & PRONTUÁRIO COMPLETO
 # ------------------------------------------
 with tab_pac:
-    st.subheader("Base de Pacientes")
+    st.subheader("👥 Base de Pacientes e Histórico Clínico")
     df_pac = read_data("Pacientes", PAC_COLS)
-    df_pac_active = df_pac[df_pac['Status'] == 'Ativo'] if not df_pac.empty else df_pac
+    df_pac_active = df_pac[df_pac['Status'] == 'Ativo'] if not df_pac.empty else pd.DataFrame()
 
     if df_pac_active.empty:
         st.info("Nenhum paciente cadastrado.")
     else:
         col_fpac, col_dpac = st.columns([3, 1])
         busca_pac = col_fpac.text_input("🔍 Buscar Paciente:", placeholder="Digite o nome do paciente...")
-        
         df_p_show = df_pac_active[df_pac_active['Paciente'].str.contains(busca_pac, case=False, na=False)] if busca_pac else df_pac_active
         col_dpac.download_button("📊 Baixar Excel", data=export_to_excel(df_p_show), file_name="pacientes.xlsx", use_container_width=True)
 
         st.dataframe(df_p_show[['Paciente', 'Telefone', 'Email', 'Ultima_Ida', 'Recorrencia']], use_container_width=True)
 
-        st.subheader("📋 Histórico Clínico do Paciente")
-        pac_sel = st.selectbox("Selecione o Paciente para ver o histórico:", options=df_pac_active['Paciente'].tolist())
+        st.markdown("---")
+        st.subheader("📋 Prontuário / Histórico Completo do Paciente")
+        pac_sel = st.selectbox("Selecione o Paciente para visualizar todas as consultas:", options=df_pac_active['Paciente'].tolist())
+        
         if pac_sel:
             row_p = df_pac_active[df_pac_active['Paciente'] == pac_sel].iloc[0]
+            st.write(f"**Paciente:** {row_p['Paciente']} | **Telefone:** {row_p.get('Telefone', 'N/A')} | **Última Ida:** {row_p.get('Ultima_Ida', 'N/A')}")
+            
+            st.write("#### Linha do Tempo de Atendimentos:")
             historico_raw = str(row_p['Historico_Procedimentos']).split(" | ")
             for item in historico_raw:
                 if item and item != 'nan':
-                    st.write(f"• {item}")
+                    st.info(f"📌 {item}")
 
 # ------------------------------------------
-# TAB 5: CONFIGURAÇÕES & TAXAS
+# TAB 6: LIVRO CAIXA (FLUXO FINANCEIRO)
+# ------------------------------------------
+with tab_caixa:
+    st.subheader("💵 Livro Caixa (Gestão Financeira da Clínica)")
+    df_caixa = read_data("LivroCaixa", CAIXA_COLS)
+    
+    with st.expander("➕ Lançar Nova Entrada ou Saída", expanded=False):
+        with st.form("form_caixa"):
+            c_cx1, c_cx2, c_cx3 = st.columns(3)
+            dt_trans = c_cx1.date_input("Data*", value=datetime.now())
+            tipo_trans = c_cx2.selectbox("Tipo*", ["Entrada (Receita)", "Saída (Despesa)"])
+            categoria = c_cx3.selectbox("Categoria*", [
+                "Atendimento / Consulta", "Procedimento Estético", "Compra de Materiais",
+                "Aluguel / Custos Fixos", "Impostos", "Marketing", "Outros"
+            ])
+            
+            c_cx4, c_cx5, c_cx6 = st.columns(3)
+            desc_trans = c_cx4.text_input("Descrição*", placeholder="Ex: Paciente Maria PIX")
+            val_trans = c_cx5.number_input("Valor (R$)*", min_value=0.01, step=50.0)
+            forma_pag = c_cx6.selectbox("Forma de Pagamento", ["PIX", "Cartão de Crédito", "Cartão de Débito", "Dinheiro", "Transferência"])
+
+            if st.form_submit_button("Gravar Lançamento"):
+                novo_lc = {
+                    'ID': len(df_caixa) + 1,
+                    'Data': dt_trans.strftime("%d/%m/%Y"),
+                    'Tipo': tipo_trans,
+                    'Categoria': categoria,
+                    'Descricao': desc_trans,
+                    'Valor': round(val_trans, 2),
+                    'Forma_Pagamento': forma_pag,
+                    'Status': 'Ativo'
+                }
+                df_caixa = pd.concat([df_caixa, pd.DataFrame([novo_lc])], ignore_index=True)
+                write_data("LivroCaixa", df_caixa)
+                st.success("Lançamento gravado com sucesso!")
+                st.rerun()
+
+    st.markdown("---")
+    df_cx_active = df_caixa[df_caixa['Status'] == 'Ativo'] if not df_caixa.empty else pd.DataFrame()
+
+    if not df_cx_active.empty:
+        # Métricas do Livro Caixa
+        entradas = df_cx_active[df_cx_active['Tipo'] == 'Entrada (Receita)']['Valor'].astype(float).sum()
+        saidas = df_cx_active[df_cx_active['Tipo'] == 'Saída (Despesa)']['Valor'].astype(float).sum()
+        saldo = entradas - saidas
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("🟢 Total Entradas", f"R$ {entradas:,.2f}")
+        mc2.metric("🔴 Total Saídas", f"R$ {saidas:,.2f}")
+        mc3.metric("⚖️ Saldo do Período", f"R$ {saldo:,.2f}")
+
+        st.markdown("---")
+        st.write("### 📋 Extrato de Lançamentos")
+        st.dataframe(df_cx_active.drop(columns=['Status'], errors='ignore'), use_container_width=True)
+
+# ------------------------------------------
+# TAB 7: CONFIGURAÇÕES & TAXAS
 # ------------------------------------------
 with tab_cfg:
-    st.subheader("⚙️ Configurações do Consultório e Taxas de Cartão")
-    st.caption("Altere os custos fixos e taxas abaixo. Eles serão gravados permanentemente no banco de dados.")
+    st.subheader("⚙️ Configurações do Consultório & Taxas de Cartão")
+    st.caption("Altere os parâmetros abaixo. Eles são aplicados automaticamente em toda a precificação.")
 
     with st.form("form_config"):
+        st.write("### 1. Custos Fixos & Margens da Clínica")
         c_c1, c_c2 = st.columns(2)
         novo_aluguel = c_c1.number_input("Custo de Aluguel por Consulta (R$)", value=aluguel_consulta, step=5.0)
         novo_imposto = c_c2.number_input("Imposto Geral Padrão (%)", value=imposto_geral, step=0.5)
         novo_lucro = c_c1.number_input("Margem de Lucro Geral (%)", value=lucro_geral, step=1.0)
 
         st.markdown("---")
-        st.write("#### Taxas da Maquininha de Cartão (%)")
-        t1 = c_c1.number_input("Taxa Cartão 1x / À Vista (%)", value=taxas_cartao[1], step=0.1)
-        t2 = c_c2.number_input("Taxa Cartão 2x (%)", value=taxas_cartao[2], step=0.1)
-        t3 = c_c1.number_input("Taxa Cartão 3x (%)", value=taxas_cartao[3], step=0.1)
-        t6 = c_c2.number_input("Taxa Cartão 6x (%)", value=taxas_cartao[6], step=0.1)
-        t12 = c_c1.number_input("Taxa Cartão 12x (%)", value=taxas_cartao[12], step=0.1)
+        st.write("### 2. Taxas da Maquininha de Cartão (1x até 12x)")
+        
+        novas_taxas = {}
+        cols_tx = st.columns(4)
+        for i in range(1, 13):
+            col_idx = (i - 1) % 4
+            novas_taxas[i] = cols_tx[col_idx].number_input(f"Taxa {i}x (%)", value=taxas_cartao[i], step=0.1)
 
         if st.form_submit_button("💾 Salvar Parâmetros no Banco de Dados"):
             novas_configs = [
                 {'Chave': 'aluguel_consulta', 'Valor': novo_aluguel},
                 {'Chave': 'imposto_geral', 'Valor': novo_imposto},
-                {'Chave': 'lucro_geral', 'Valor': novo_lucro},
-                {'Chave': 'taxa_1x', 'Valor': t1},
-                {'Chave': 'taxa_2x', 'Valor': t2},
-                {'Chave': 'taxa_3x', 'Valor': t3},
-                {'Chave': 'taxa_6x', 'Valor': t6},
-                {'Chave': 'taxa_12x', 'Valor': t12}
+                {'Chave': 'lucro_geral', 'Valor': novo_lucro}
             ]
+            for i in range(1, 13):
+                novas_configs.append({'Chave': f'taxa_{i}x', 'Valor': novas_taxas[i]})
+
             write_data("Configuracoes", pd.DataFrame(novas_configs))
-            st.success("Configurações atualizadas com sucesso!")
+            st.success("Configurações salvas!")
             st.rerun()
 
 # ------------------------------------------
-# TAB 6: LIXEIRA / SEGURANÇA
+# TAB 8: LIXEIRA / SEGURANÇA
 # ------------------------------------------
 with tab_trash:
     st.subheader("🗑️ Lixeira do Sistema & Restauração")
-    cat_del = st.selectbox("Categoria:", ["Materiais", "Procedimentos", "Agenda", "Pacientes"])
+    cat_del = st.selectbox("Categoria para restaurar:", ["Materiais", "Procedimentos", "Agenda", "Pacientes", "LivroCaixa"])
 
     if cat_del == "Materiais":
         df_t = read_data("Materiais", MAT_COLS)
@@ -557,6 +822,9 @@ with tab_trash:
     elif cat_del == "Agenda":
         df_t = read_data("Agenda", AG_COLS)
         k_col = "Paciente"
+    elif cat_del == "LivroCaixa":
+        df_t = read_data("LivroCaixa", CAIXA_COLS)
+        k_col = "Descricao"
     else:
         df_t = read_data("Pacientes", PAC_COLS)
         k_col = "Paciente"
@@ -564,7 +832,7 @@ with tab_trash:
     if not df_t.empty:
         df_ex = df_t[df_t['Status'] == 'Excluido']
         if df_ex.empty:
-            st.success(f"Nenhum item na lixeira de {cat_del}.")
+            st.info(f"Nenhum item na lixeira de {cat_del}.")
         else:
             st.dataframe(df_ex, use_container_width=True)
             res_item = st.selectbox(f"Restaurar de {cat_del}:", options=df_ex[k_col].tolist())
