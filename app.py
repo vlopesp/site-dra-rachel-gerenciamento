@@ -1,998 +1,300 @@
-import io
-import re
-import unicodedata
-import gspread
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from datetime import datetime
+import hashlib
+import json
+import io
+
+from streamlit_gsheets import GSheetsConnection
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-# ------------------------------------------
-# CONFIGURAÇÃO DE COLUNAS DAS PLANILHAS
-# ------------------------------------------
-CFG_COLS = ["Chave", "Valor"]
-
-MAT_COLS = [
-    "ID",
-    "Material",
-    "Custo_Embalagem",
-    "Rendimento",
-    "Custo_Por_Paciente",
-    "Procedimentos_Vinculados",
-    "Status",
-]
-
-PROC_COLS = [
-    "ID",
-    "Procedimento",
-    "Custo_Materiais",
-    "Qtd_Consultas",
-    "Custo_Aluguel",
-    "Tipo_Lucro",
-    "Lucro_Valor",
-    "Lucro_Calculado_RS",
-    "Imposto_Valor",
-    "Parcelas",
-    "Taxa_Cartao_Pct",
-    "Custo_Cartao",
-    "Total_PIX",
-    "Total_Cartao",
-    "Status",
-]
-
-AGENDA_COLS = [
-    "ID",
-    "Data",
-    "Horario",
-    "Paciente",
-    "Procedimento",
-    "Valor_Cobrado",
-    "Forma_Pagamento",
-    "Status_Agendamento",
-    "Status",
-]
-
-PAC_COLS = [
-    "ID",
-    "Nome",
-    "CPF",
-    "Telefone",
-    "Email",
-    "Historico_Procedimentos",
-    "Status",
-]
-
-CAIXA_COLS = [
-    "ID",
-    "Data",
-    "Tipo",
-    "Categoria",
-    "Descricao",
-    "Valor",
-    "Status",
-]
-
-
-# ------------------------------------------
-# NORMALIZAÇÃO DE NOMES E CONEXÃO BLINDADA
-# ------------------------------------------
-def normalizar_texto(texto):
-    """Remove acentos, espaços e maiúsculas para comparar nomes de abas com segurança."""
-    return (
-        unicodedata.normalize("NFKD", str(texto))
-        .encode("ASCII", "ignore")
-        .decode("utf-8")
-        .lower()
-        .replace(" ", "")
-        .replace("_", "")
-    )
-
-
-@st.cache_resource
-def get_gspread_client():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    # Lê as credenciais diretamente do bloco [connections.gsheets]
-    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
-        creds_dict = dict(st.secrets["connections"]["gsheets"])
-    elif "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-    else:
-        creds_dict = dict(st.secrets)
-
-    if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace(
-            "\\n", "\n"
-        )
-
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    return gspread.authorize(creds)
-
-
-def get_spreadsheet():
-    client = get_gspread_client()
-
-    # Busca a URL ou ID no bloco [connections.gsheets]
-    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
-        sec = st.secrets["connections"]["gsheets"]
-        sheet_target = sec.get("spreadsheet") or sec.get("spreadsheet_id")
-    elif "spreadsheet_id" in st.secrets:
-        sheet_target = st.secrets["spreadsheet_id"]
-    elif "sheets" in st.secrets and "spreadsheet_id" in st.secrets["sheets"]:
-        sheet_target = st.secrets["sheets"]["spreadsheet_id"]
-    else:
-        raise KeyError(
-            "Não foi encontrada a chave 'spreadsheet' ou 'spreadsheet_id' no seu secrets.toml."
-        )
-
-    sheet_str = str(sheet_target).strip()
-
-    # Abre por URL se contiver o link, ou por ID caso seja apenas a chave
-    if "docs.google.com" in sheet_str:
-        return client.open_by_url(sheet_str)
-    return client.open_by_key(sheet_str)
-
-
-def get_worksheet_safely(sh, target_name):
-    target_norm = normalizar_texto(target_name)
-    possible_targets = [target_norm]
-    if target_norm == "caixa":
-        possible_targets.append("livrocaixa")
-
-    worksheets = sh.worksheets()
-    for ws in worksheets:
-        if normalizar_texto(ws.title) in possible_targets:
-            return ws
-
-    titles = [w.title for w in worksheets]
-    raise Exception(
-        f"Aba '{target_name}' não foi encontrada. Abas presentes na planilha: {titles}"
-    )
-
-
-def read_data(sheet_name, expected_cols):
-    try:
-        sh = get_spreadsheet()
-        ws = get_worksheet_safely(sh, sheet_name)
-        data = ws.get_all_values()
-
-        if not data or len(data) < 1:
-            return pd.DataFrame(columns=expected_cols)
-
-        headers = [str(h).strip() for h in data[0]]
-        rows = data[1:] if len(data) > 1 else []
-        df = pd.DataFrame(rows, columns=headers)
-
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = ""
-
-        return df[expected_cols]
-    except Exception as e:
-        st.error(f"Erro ao carregar a aba '{sheet_name}': {e}")
-        return pd.DataFrame(columns=expected_cols)
-
-
-def write_data(sheet_name, df):
-    try:
-        sh = get_spreadsheet()
-        ws = get_worksheet_safely(sh, sheet_name)
-        ws.clear()
-        df_to_write = df.fillna("")
-        values = [
-            df_to_write.columns.values.tolist()
-        ] + df_to_write.values.tolist()
-        ws.update(values)
-    except Exception as e:
-        st.error(f"Erro ao salvar na aba '{sheet_name}': {e}")
-
-
-def export_to_excel(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Dados")
-    return output.getvalue()
-
-
-# ------------------------------------------
-# REGRAS E FUNÇÕES DE CÁLCULO
-# ------------------------------------------
-def get_cfg_val(df_cfg, chave, valor_padrao):
-    if (
-        not df_cfg.empty
-        and "Chave" in df_cfg.columns
-        and chave in df_cfg["Chave"].values
-    ):
-        try:
-            val_raw = str(df_cfg[df_cfg["Chave"] == chave]["Valor"].values[0])
-            val_clean = val_raw.replace(",", ".").strip()
-            return float(val_clean)
-        except Exception:
-            return valor_padrao
-    return valor_padrao
-
-
-def recalcular_procedimentos_df(
-    df_p, df_m_ref, aluguel_cons, imposto_g, lucro_g, taxas_c
-):
-    if df_p.empty:
-        return df_p
-
-    df_m_ativos = (
-        df_m_ref[df_m_ref["Status"] == "Ativo"]
-        if not df_m_ref.empty
-        else pd.DataFrame()
-    )
-
-    for idx in df_p.index:
-        row = df_p.loc[idx]
-        nome_p = str(row["Procedimento"]).strip()
-
-        # 1. Custo Materiais
-        custo_materiais_total = 0.0
-        if not df_m_ativos.empty:
-            for _, mat in df_m_ativos.iterrows():
-                vincs = [
-                    x.strip()
-                    for x in str(mat["Procedimentos_Vinculados"]).split(",")
-                ]
-                if nome_p in vincs or "Geral" in vincs:
-                    try:
-                        c_m = float(
-                            str(mat["Custo_Por_Paciente"]).replace(",", ".")
-                        )
-                    except Exception:
-                        c_m = 0.0
-                    custo_materiais_total += c_m
-
-        # 2. Consultas e Aluguel
-        try:
-            qtd_consultas = int(
-                float(str(row["Qtd_Consultas"]).replace(",", "."))
-            )
-        except Exception:
-            qtd_consultas = 1
-        if qtd_consultas < 1:
-            qtd_consultas = 1
-
-        custo_aluguel_total = qtd_consultas * aluguel_cons
-        custo_base = custo_materiais_total + custo_aluguel_total
-
-        # 3. Lógica Dinâmica de Lucro
-        tipo_lucro = str(row.get("Tipo_Lucro", "Percentual Geral")).strip()
-        try:
-            val_lucro_input = float(
-                str(row.get("Lucro_Valor", 0.0)).replace(",", ".")
-            )
-        except Exception:
-            val_lucro_input = 0.0
-
-        if tipo_lucro == "Percentual Geral":
-            val_exibicao = lucro_g
-            valor_lucro_rs = custo_base * (lucro_g / 100.0)
-        elif tipo_lucro == "Percentual Específico":
-            val_exibicao = val_lucro_input
-            valor_lucro_rs = custo_base * (val_lucro_input / 100.0)
-        else:  # Valor Fixo
-            val_exibicao = val_lucro_input
-            valor_lucro_rs = val_lucro_input
-
-        # 4. Imposto e PIX
-        subtotal = custo_base + valor_lucro_rs
-        valor_imposto = subtotal * (imposto_g / 100.0)
-        total_pix = subtotal + valor_imposto
-
-        # 5. Parcelamento e Cartão
-        parc_str = str(row.get("Parcelas", "1x"))
-        try:
-            parcelas_sel = int(re.sub(r"\D", "", parc_str))
-        except Exception:
-            parcelas_sel = 1
-        if parcelas_sel < 1:
-            parcelas_sel = 1
-        if parcelas_sel > 12:
-            parcelas_sel = 12
-
-        taxa_cartao_pct = taxas_c.get(parcelas_sel, 3.0)
-        total_cartao = (
-            total_pix / (1 - (taxa_cartao_pct / 100.0))
-            if taxa_cartao_pct < 100
-            else total_pix
-        )
-        custo_cartao = total_cartao - total_pix
-
-        # Atualiza a tabela
-        df_p.loc[idx, "Custo_Materiais"] = round(custo_materiais_total, 2)
-        df_p.loc[idx, "Qtd_Consultas"] = qtd_consultas
-        df_p.loc[idx, "Custo_Aluguel"] = round(custo_aluguel_total, 2)
-        df_p.loc[idx, "Tipo_Lucro"] = tipo_lucro
-        df_p.loc[idx, "Lucro_Valor"] = round(val_exibicao, 2)
-        df_p.loc[idx, "Lucro_Calculado_RS"] = round(valor_lucro_rs, 2)
-        df_p.loc[idx, "Imposto_Valor"] = round(valor_imposto, 2)
-        df_p.loc[idx, "Parcelas"] = f"{parcelas_sel}x"
-        df_p.loc[idx, "Taxa_Cartao_Pct"] = f"{taxa_cartao_pct}%"
-        df_p.loc[idx, "Custo_Cartao"] = round(custo_cartao, 2)
-        df_p.loc[idx, "Total_PIX"] = round(total_pix, 2)
-        df_p.loc[idx, "Total_Cartao"] = round(total_cartao, 2)
-
-    return df_p
-
-
-# ------------------------------------------
-# LAYOUT PRINCIPAL DO STREAMLIT
-# ------------------------------------------
+# ==========================================
+# 1. CONFIGURAÇÃO DA PÁGINA E TEMA ROSÊ
+# ==========================================
 st.set_page_config(
-    page_title="Sistema de Precificação & Gestão",
-    layout="wide",
-    page_icon="⚖️",
-)
-st.title("🏥 Sistema de Gestão e Precificação")
-
-# Carregar Configurações Globais
-df_cfg = read_data("Configuracoes", CFG_COLS)
-aluguel_consulta = get_cfg_val(df_cfg, "Aluguel_Consulta", 50.0)
-imposto_geral = get_cfg_val(df_cfg, "Imposto_Geral", 6.0)
-lucro_geral = get_cfg_val(df_cfg, "Lucro_Geral", 40.0)
-
-taxas_cartao = {}
-for i in range(1, 13):
-    taxas_cartao[i] = get_cfg_val(
-        df_cfg, f"Taxa_Cartao_{i}x", 3.0 + (i - 1) * 0.8
-    )
-
-# Navegação por Abas
-tab_cfg, tab_mat, tab_proc, tab_agenda, tab_pac, tab_caixa, tab_lixeira = (
-    st.tabs([
-        "⚙️ Configurações",
-        "📦 Materiais",
-        "⚖️ Precificação",
-        "📅 Agenda",
-        "👥 Pacientes",
-        "💵 Caixa",
-        "🗑️ Lixeira",
-    ])
+    page_title="Gestão Clínica - Dra. Rachel Leal",
+    page_icon="🩺",
+    layout="wide"
 )
 
+# Estilização CSS Personalizada (Paleta Rosê)
+st.markdown("""
+<style>
+    :root {
+        --primary-color: #d09395;
+        --secondary-color: #f97a7e;
+        --background-color: #fdfbfb;
+    }
+    .stButton>button {
+        background-color: var(--primary-color);
+        color: white;
+        border-radius: 8px;
+        border: none;
+        padding: 0.5rem 1rem;
+        font-weight: bold;
+    }
+    .stButton>button:hover {
+        background-color: var(--secondary-color);
+        color: white;
+    }
+    .metric-card {
+        background-color: #ffffff;
+        border-left: 5px solid #d09395;
+        padding: 15px;
+        border-radius: 8px;
+        box-shadow: 0px 2px 5px rgba(0,0,0,0.05);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ------------------------------------------
-# TAB 1: CONFIGURAÇÕES
-# ------------------------------------------
-with tab_cfg:
-    st.subheader("⚙️ Configurações Gerais da Clínica")
-    with st.form("form_cfg"):
-        c1, c2, c3 = st.columns(3)
-        novo_aluguel = c1.number_input(
-            "Custo de Aluguel por Consulta (R$)",
-            value=float(aluguel_consulta),
-            step=5.0,
-        )
-        novo_imposto = c2.number_input(
-            "Imposto Geral (%)", value=float(imposto_geral), step=0.5
-        )
-        novo_lucro = c3.number_input(
-            "Margem de Lucro Geral (%)", value=float(lucro_geral), step=1.0
-        )
+# ==========================================
+# 2. AUTENTICAÇÃO SEGURA (HASH)
+# ==========================================
+USERS = {
+    "admin": hashlib.sha256("dra.rachel2026".encode()).hexdigest(),
+    "recepcao": hashlib.sha256("clinica123".encode()).hexdigest()
+}
 
-        st.markdown("---")
-        st.write("💳 **Taxas de Cartão de Crédito por Parcelamento**")
-        novas_taxas = {}
-        cols_t = st.columns(4)
-        for i in range(1, 13):
-            col_idx = (i - 1) % 4
-            novas_taxas[i] = cols_t[col_idx].number_input(
-                f"Taxa {i}x (%)", value=float(taxas_cartao[i]), step=0.1
-            )
+def verify_password(username, password):
+    hashed_input = hashlib.sha256(password.encode()).hexdigest()
+    return USERS.get(username) == hashed_input
 
-        if st.form_submit_button("💾 Salvar Configurações Globais"):
-            novos_dados = [
-                {"Chave": "Aluguel_Consulta", "Valor": novo_aluguel},
-                {"Chave": "Imposto_Geral", "Valor": novo_imposto},
-                {"Chave": "Lucro_Geral", "Valor": novo_lucro},
-            ]
-            for i in range(1, 13):
-                novos_dados.append(
-                    {"Chave": f"Taxa_Cartao_{i}x", "Valor": novas_taxas[i]}
-                )
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
-            df_new_cfg = pd.DataFrame(novos_dados)
-            write_data("Configuracoes", df_new_cfg)
-            st.success("Configurações atualizadas com sucesso!")
-            st.rerun()
-
-
-# ------------------------------------------
-# TAB 2: MATERIAIS
-# ------------------------------------------
-with tab_mat:
-    st.subheader("📦 Cadastro e Gestão de Materiais")
-    df_mat = read_data("Materiais", MAT_COLS)
-
-    with st.expander("➕ Cadastrar Novo Material", expanded=False):
-        with st.form("form_mat"):
-            m1, m2, m3, m4 = st.columns(4)
-            nome_m = m1.text_input("Nome do Material*")
-            custo_emb = m2.number_input(
-                "Custo da Embalagem (R$)*", min_value=0.0, step=1.0
-            )
-            rendimento = m3.number_input(
-                "Rendimento (Pacientes/Uso)*", min_value=1, value=1
-            )
-            vinc_proc = m4.text_input(
-                "Vinculado ao Procedimento",
-                value="Geral",
-                help="Digite 'Geral' ou o nome exato do procedimento.",
-            )
-
-            if st.form_submit_button("Salvar Material"):
-                custo_pac = (
-                    custo_emb / rendimento if rendimento > 0 else custo_emb
-                )
-                novo_id = len(df_mat) + 1
-                novo_m = {
-                    "ID": novo_id,
-                    "Material": nome_m,
-                    "Custo_Embalagem": round(custo_emb, 2),
-                    "Rendimento": rendimento,
-                    "Custo_Por_Paciente": round(custo_pac, 2),
-                    "Procedimentos_Vinculados": vinc_proc,
-                    "Status": "Ativo",
-                }
-                df_mat = pd.concat(
-                    [df_mat, pd.DataFrame([novo_m])], ignore_index=True
-                )
-                write_data("Materiais", df_mat)
-                st.success("Material cadastrado com sucesso!")
+if not st.session_state.authenticated:
+    st.title("🔒 Acesso ao Sistema - Dra. Rachel Leal")
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        user_input = st.text_input("Usuário")
+        pass_input = st.text_input("Senha", type="password")
+        if st.button("Entrar"):
+            if verify_password(user_input, pass_input):
+                st.session_state.authenticated = True
+                st.session_state.username = user_input
                 st.rerun()
-
-    st.markdown("---")
-    df_mat_active = (
-        df_mat[df_mat["Status"] == "Ativo"]
-        if not df_mat.empty
-        else pd.DataFrame()
-    )
-    if not df_mat_active.empty:
-        col_f, col_d = st.columns([3, 1])
-        busca = col_f.text_input(
-            "🔍 Buscar Material:", placeholder="Digite para filtrar..."
-        )
-        df_m_disp = (
-            df_mat_active[
-                df_mat_active["Material"].str.contains(
-                    busca, case=False, na=False
-                )
-            ]
-            if busca
-            else df_mat_active
-        )
-        col_d.download_button(
-            "📊 Baixar Excel",
-            data=export_to_excel(df_m_disp),
-            file_name="materiais.xlsx",
-            use_container_width=True,
-        )
-
-        edited_mat = st.data_editor(
-            df_m_disp.drop(columns=["Status"], errors="ignore"),
-            use_container_width=True,
-            key="editor_mat",
-        )
-
-        if st.button("💾 Salvar Alterações em Materiais"):
-            for idx, row in edited_mat.iterrows():
-                m_id = str(row["ID"]).strip()
-                mask = df_mat["ID"].astype(str).str.strip() == m_id
-                c_emb = float(str(row["Custo_Embalagem"]).replace(",", "."))
-                rend = (
-                    int(float(str(row["Rendimento"]).replace(",", ".")))
-                    if int(float(str(row["Rendimento"]).replace(",", "."))) > 0
-                    else 1
-                )
-                df_mat.loc[mask, "Material"] = row["Material"]
-                df_mat.loc[mask, "Custo_Embalagem"] = round(c_emb, 2)
-                df_mat.loc[mask, "Rendimento"] = rend
-                df_mat.loc[mask, "Custo_Por_Paciente"] = round(c_emb / rend, 2)
-                df_mat.loc[mask, "Procedimentos_Vinculados"] = row[
-                    "Procedimentos_Vinculados"
-                ]
-
-            write_data("Materiais", df_mat)
-            st.success("Materiais atualizados!")
-            st.rerun()
-
-        st.markdown("---")
-        cm_del1, cm_del2 = st.columns([3, 1])
-        mat_del = cm_del1.selectbox(
-            "Remover Material:",
-            options=df_mat_active["Material"].tolist(),
-            key="sel_del_mat",
-        )
-        if cm_del2.button("🗑️ Mover Material para Lixeira"):
-            mask = (
-                df_mat["Material"].astype(str).str.strip()
-                == str(mat_del).strip()
-            )
-            df_mat.loc[mask, "Status"] = "Excluido"
-            write_data("Materiais", df_mat)
-            st.warning("Material movido para a lixeira!")
-            st.rerun()
-
-
-# ------------------------------------------
-# TAB 3: PRECIFICAÇÃO
-# ------------------------------------------
-with tab_proc:
-    st.subheader("⚖️ Cálculo e Precificação de Procedimentos")
-    df_proc = read_data("Procedimentos", PROC_COLS)
-    df_mat_ref = read_data("Materiais", MAT_COLS)
-
-    if not df_proc.empty:
-        df_proc = recalcular_procedimentos_df(
-            df_proc,
-            df_mat_ref,
-            aluguel_consulta,
-            imposto_geral,
-            lucro_geral,
-            taxas_cartao,
-        )
-
-    with st.expander("➕ Precificar Novo Procedimento", expanded=False):
-        with st.form("form_proc"):
-            c1, c2, c3 = st.columns(3)
-            nome_p = c1.text_input("Nome do Procedimento*")
-            qtd_consultas = c2.number_input(
-                "Qtd. de Consultas/Idas*", min_value=1, value=1
-            )
-            tipo_lucro = c3.selectbox(
-                "Tipo de Lucro",
-                ["Percentual Geral", "Percentual Específico", "Valor Fixo"],
-            )
-
-            val_lucro_input = 0.0
-            if tipo_lucro == "Percentual Específico":
-                val_lucro_input = c3.number_input(
-                    "Lucro Específico (%)", min_value=0.0, value=30.0
-                )
-            elif tipo_lucro == "Valor Fixo":
-                val_lucro_input = c3.number_input(
-                    "Lucro Fixo (R$)", min_value=0.0, value=150.0
-                )
             else:
-                val_lucro_input = lucro_geral
+                st.error("Usuário ou senha incorretos.")
+    st.stop()
 
-            parcelas_sel = c2.selectbox(
-                "Parcelamento Cartão",
-                options=list(range(1, 13)),
-                format_func=lambda x: f"{x}x",
-            )
+# ==========================================
+# 3. CONEXÃO COM GOOGLE SHEETS E DRIVE
+# ==========================================
+@st.cache_resource
+def get_drive_service():
+    """Autentica na API do Google Drive utilizando as credenciais salvas em st.secrets."""
+    try:
+        creds_dict = json.loads(st.secrets["textkey"])
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        st.warning(f"Aviso: Não foi possível conectar ao Google Drive ({e}). uploads desativados.")
+        return None
 
-            if st.form_submit_button("Calcular e Salvar Procedimento"):
-                novo_id = len(df_proc) + 1
-                novo_p = {
-                    "ID": novo_id,
-                    "Procedimento": nome_p,
-                    "Custo_Materiais": 0.0,
-                    "Qtd_Consultas": qtd_consultas,
-                    "Custo_Aluguel": 0.0,
-                    "Tipo_Lucro": tipo_lucro,
-                    "Lucro_Valor": round(val_lucro_input, 2),
-                    "Lucro_Calculado_RS": 0.0,
-                    "Imposto_Valor": 0.0,
-                    "Parcelas": f"{parcelas_sel}x",
-                    "Taxa_Cartao_Pct": "0%",
-                    "Custo_Cartao": 0.0,
-                    "Total_PIX": 0.0,
-                    "Total_Cartao": 0.0,
-                    "Status": "Ativo",
-                }
-                df_proc = pd.concat(
-                    [df_proc, pd.DataFrame([novo_p])], ignore_index=True
-                )
-                df_proc = recalcular_procedimentos_df(
-                    df_proc,
-                    df_mat_ref,
-                    aluguel_consulta,
-                    imposto_geral,
-                    lucro_geral,
-                    taxas_cartao,
-                )
-                write_data("Procedimentos", df_proc)
-                st.success("Procedimento cadastrado e recalculado!")
-                st.rerun()
+def upload_to_drive(file_bytes, file_name, mime_type, folder_id=None):
+    """Envia um arquivo diretamente para a pasta do Google Drive."""
+    service = get_drive_service()
+    if not service:
+        return None
+    
+    file_metadata = {'name': file_name}
+    if folder_id:
+        file_metadata['parents'] = [folder_id]
+        
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
+    uploaded_file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, webViewLink'
+    ).execute()
+    
+    return uploaded_file.get('webViewLink')
+
+# Conexão com Google Sheets via st.connection
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+def load_data(worksheet_name):
+    try:
+        return conn.read(worksheet=worksheet_name, ttl="0")
+    except Exception:
+        return pd.DataFrame()
+
+# ==========================================
+# 4. INTERFACE PRINCIPAL E NAVEGAÇÃO
+# ==========================================
+st.sidebar.title("🩺 Gestão Clínica")
+st.sidebar.write(f"Usuário: **{st.session_state.username}**")
+
+menu = st.sidebar.radio("Navegação", [
+    "📊 Dashboard",
+    "📅 Agenda & Prontuário",
+    "💰 Precificação & Custos",
+    "💵 Livro Caixa",
+    "🗑️ Lixeira"
+])
+
+if st.sidebar.button("Sair"):
+    st.session_state.authenticated = False
+    st.rerun()
+
+# ------------------------------------------
+# MÓDULO 1: DASHBOARD DE RESUMO
+# ------------------------------------------
+if menu == "📊 Dashboard":
+    st.title("📊 Painel Geral de Desempenho")
+    
+    df_caixa = load_data("LivroCaixa")
+    df_agenda = load_data("Agenda")
+
+    col1, col2, col3, col4 = st.columns(4)
+    
+    receita_total = df_caixa[df_caixa['Tipo'] == 'Receita']['Valor'].sum() if not df_caixa.empty and 'Valor' in df_caixa.columns else 0.0
+    despesa_total = df_caixa[df_caixa['Tipo'] == 'Despesa']['Valor'].sum() if not df_caixa.empty and 'Valor' in df_caixa.columns else 0.0
+    saldo = receita_total - despesa_total
+    atendimentos = len(df_agenda) if not df_agenda.empty else 0
+
+    with col1:
+        st.markdown(f"<div class='metric-card'><h4>Receitas</h4><h3>R$ {receita_total:,.2f}</h3></div>", unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"<div class='metric-card'><h4>Despesas</h4><h3>R$ {despesa_total:,.2f}</h3></div>", unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"<div class='metric-card'><h4>Saldo Líquido</h4><h3>R$ {saldo:,.2f}</h3></div>", unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"<div class='metric-card'><h4>Agendamentos</h4><h3>{atendimentos}</h3></div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    df_proc_active = (
-        df_proc[df_proc["Status"] == "Ativo"]
-        if not df_proc.empty
-        else pd.DataFrame()
-    )
-    if not df_proc_active.empty:
-        col_fp, col_dp = st.columns([3, 1])
-        busca_p = col_fp.text_input(
-            "🔍 Filtrar Procedimentos:",
-            placeholder="Digite o nome do procedimento...",
-        )
-        df_p_disp = (
-            df_proc_active[
-                df_proc_active["Procedimento"].str.contains(
-                    busca_p, case=False, na=False
-                )
-            ]
-            if busca_p
-            else df_proc_active
-        )
-        col_dp.download_button(
-            "📊 Baixar Excel",
-            data=export_to_excel(df_p_disp),
-            file_name="procedimentos.xlsx",
-            use_container_width=True,
-        )
-
-        edited_proc = st.data_editor(
-            df_p_disp.drop(columns=["Status"], errors="ignore"),
-            column_config={
-                "Tipo_Lucro": st.column_config.SelectboxColumn(
-                    "Tipo de Lucro",
-                    options=[
-                        "Percentual Geral",
-                        "Percentual Específico",
-                        "Valor Fixo",
-                    ],
-                    required=True,
-                ),
-                "Lucro_Valor": st.column_config.NumberColumn(
-                    "Lucro (Configuração)",
-                    help="Exibe o % Geral dinâmico, o % Específico digitado ou o Valor Fixo em R$.",
-                ),
-                "Lucro_Calculado_RS": st.column_config.NumberColumn(
-                    "Lucro Final (R$)",
-                    help="Resultado financeiro em R$ obtido após o cálculo.",
-                    disabled=True,
-                ),
-            },
-            use_container_width=True,
-            key="editor_proc",
-        )
-
-        if st.button("💾 Salvar Alterações e Recalcular Preços"):
-            for idx, row in edited_proc.iterrows():
-                p_id = str(row["ID"]).strip()
-                mask = df_proc["ID"].astype(str).str.strip() == p_id
-                df_proc.loc[mask, "Procedimento"] = row["Procedimento"]
-                df_proc.loc[mask, "Qtd_Consultas"] = row["Qtd_Consultas"]
-                df_proc.loc[mask, "Tipo_Lucro"] = row["Tipo_Lucro"]
-                df_proc.loc[mask, "Lucro_Valor"] = row["Lucro_Valor"]
-                df_proc.loc[mask, "Parcelas"] = row["Parcelas"]
-
-            df_proc = recalcular_procedimentos_df(
-                df_proc,
-                df_mat_ref,
-                aluguel_consulta,
-                imposto_geral,
-                lucro_geral,
-                taxas_cartao,
-            )
-            write_data("Procedimentos", df_proc)
-            st.success("Alterações salvas e precificação recalculada!")
-            st.rerun()
-
-        st.markdown("---")
-        cp_del1, cp_del2 = st.columns([3, 1])
-        proc_del = cp_del1.selectbox(
-            "Remover Procedimento:",
-            options=df_proc_active["Procedimento"].tolist(),
-            key="sel_del_proc",
-        )
-        if cp_del2.button("🗑️ Mover Procedimento para Lixeira"):
-            mask = (
-                df_proc["Procedimento"].astype(str).str.strip()
-                == str(proc_del).strip()
-            )
-            df_proc.loc[mask, "Status"] = "Excluido"
-            write_data("Procedimentos", df_proc)
-            st.warning("Procedimento movido para a lixeira!")
-            st.rerun()
-
+    st.subheader("Resumo Recente")
+    if not df_caixa.empty:
+        st.dataframe(df_caixa.tail(10), use_container_width=True)
 
 # ------------------------------------------
-# TAB 4: AGENDA
+# MÓDULO 2: AGENDA & PRONTUÁRIO
 # ------------------------------------------
-with tab_agenda:
-    st.subheader("📅 Agendamentos de Consultas")
-    df_agenda = read_data("Agenda", AGENDA_COLS)
-    df_pac_ref = read_data("Pacientes", PAC_COLS)
-    df_proc_ref = read_data("Procedimentos", PROC_COLS)
+elif menu == "📅 Agenda & Prontuário":
+    st.title("📅 Agendamentos e Histórico Clínico")
+    
+    tab_agenda, tab_prontuario = st.tabs(["Agendar Consulta", "Prontuário de Pacientes"])
+    
+    with tab_agenda:
+        with st.form("form_agendamento"):
+            st.subheader("Novo Agendamento")
+            col1, col2 = st.columns(2)
+            with col1:
+                paciente = st.text_input("Nome do Paciente")
+                procedimento = st.text_input("Procedimento")
+            with col2:
+                data_atend = st.date_input("Data", datetime.now())
+                hora_atend = st.time_input("Horário")
+            
+            submit_agenda = st.form_submit_button("Salvar Agendamento")
+            
+            if submit_agenda:
+                # Checagem de Colisão simples de horário
+                df_agenda = load_data("Agenda")
+                conflito = False
+                if not df_agenda.empty and 'Data' in df_agenda.columns and 'Hora' in df_agenda.columns:
+                    match = df_agenda[(df_agenda['Data'] == str(data_atend)) & (df_agenda['Hora'] == str(hora_atend))]
+                    if not match.empty:
+                        conflito = True
 
-    with st.expander("➕ Novo Agendamento", expanded=False):
-        with st.form("form_agenda"):
-            a1, a2, a3 = st.columns(3)
-            data_ag = a1.date_input("Data")
-            hora_ag = a2.time_input("Horário")
+                if conflito:
+                    st.error("⚠️ Já existe um agendamento marcado para esta data e horário!")
+                else:
+                    st.success("Agendamento cadastrado com sucesso!")
 
-            pacs_list = (
-                df_pac_ref[df_pac_ref["Status"] == "Ativo"]["Nome"].tolist()
-                if not df_pac_ref.empty
-                else []
-            )
-            pac_sel = a3.selectbox("Paciente", options=pacs_list or [""])
-
-            a4, a5, a6 = st.columns(3)
-            procs_list = (
-                df_proc_ref[df_proc_ref["Status"] == "Ativo"][
-                    "Procedimento"
-                ].tolist()
-                if not df_proc_ref.empty
-                else []
-            )
-            proc_sel = a4.selectbox("Procedimento", options=procs_list or [""])
-
-            val_sug = 0.0
-            if proc_sel and not df_proc_ref.empty:
-                match_p = df_proc_ref[
-                    df_proc_ref["Procedimento"] == proc_sel
-                ]
-                if not match_p.empty:
-                    try:
-                        val_sug = float(
-                            str(match_p["Total_PIX"].values[0]).replace(
-                                ",", "."
-                            )
-                        )
-                    except Exception:
-                        val_sug = 0.0
-
-            val_cobrado = a5.number_input(
-                "Valor Cobrado (R$)", value=val_sug, step=10.0
-            )
-            forma_pag = a6.selectbox(
-                "Forma de Pagamento", ["PIX", "Cartão de Crédito", "Dinheiro"]
-            )
-
-            if st.form_submit_button("Agendar Consulta"):
-                novo_id = len(df_agenda) + 1
-                novo_ag = {
-                    "ID": novo_id,
-                    "Data": str(data_ag),
-                    "Horario": str(hora_ag),
-                    "Paciente": pac_sel,
-                    "Procedimento": proc_sel,
-                    "Valor_Cobrado": val_cobrado,
-                    "Forma_Pagamento": forma_pag,
-                    "Status_Agendamento": "Agendado",
-                    "Status": "Ativo",
-                }
-                df_agenda = pd.concat(
-                    [df_agenda, pd.DataFrame([novo_ag])], ignore_index=True
-                )
-                write_data("Agenda", df_agenda)
-                st.success("Consulta agendada!")
-                st.rerun()
-
-    st.markdown("---")
-    df_ag_active = (
-        df_agenda[df_agenda["Status"] == "Ativo"]
-        if not df_agenda.empty
-        else pd.DataFrame()
-    )
-    if not df_ag_active.empty:
-        edited_ag = st.data_editor(
-            df_ag_active.drop(columns=["Status"], errors="ignore"),
-            column_config={
-                "Status_Agendamento": st.column_config.SelectboxColumn(
-                    "Status",
-                    options=["Agendado", "Concluído", "Cancelado"],
-                    required=True,
-                )
-            },
-            use_container_width=True,
-            key="editor_ag",
-        )
-
-        if st.button("💾 Salvar Alterações na Agenda"):
-            for idx, row in edited_ag.iterrows():
-                ag_id = str(row["ID"]).strip()
-                mask = df_agenda["ID"].astype(str).str.strip() == ag_id
-                df_agenda.loc[mask, "Status_Agendamento"] = row[
-                    "Status_Agendamento"
-                ]
-                df_agenda.loc[mask, "Valor_Cobrado"] = row["Valor_Cobrado"]
-
-            write_data("Agenda", df_agenda)
-            st.success("Agenda atualizada!")
-            st.rerun()
-
+    with tab_prontuario:
+        st.subheader("Consulta de Prontuário")
+        paciente_busca = st.text_input("Digite o nome do paciente para buscar o histórico:")
+        if paciente_busca:
+            st.info(f"Exibindo histórico para: **{paciente_busca}**")
 
 # ------------------------------------------
-# TAB 5: PACIENTES
+# MÓDULO 3: PRECIFICAÇÃO & CUSTOS
 # ------------------------------------------
-with tab_pac:
-    st.subheader("👥 Cadastro de Pacientes")
-    df_pac = read_data("Pacientes", PAC_COLS)
+elif menu == "💰 Precificação & Custos":
+    st.title("💰 Calculadora de Precificação de Procedimentos")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        custo_materiais = st.number_input("Custo de Materiais (R$)", min_value=0.0, value=50.0, step=5.0)
+        custo_fixo_hora = st.number_input("Custo Fixo/Hora de Consultório (R$)", min_value=0.0, value=80.0, step=5.0)
+        tempo_procedimento = st.number_input("Tempo do Procedimento (Horas)", min_value=0.1, value=1.0, step=0.5)
+    
+    with col2:
+        impostos_pct = st.number_input("Impostos / Taxas (%)", min_value=0.0, value=6.0, step=0.5)
+        margem_lucro_pct = st.number_input("Margem de Lucro Desejada (%)", min_value=0.0, value=40.0, step=5.0)
+        lucro_fixo_adicional = st.number_input("Lucro Fixo Adicional (R$)", min_value=0.0, value=0.0, step=10.0)
 
-    with st.expander("➕ Cadastrar Novo Paciente", expanded=False):
-        with st.form("form_pac"):
-            p1, p2 = st.columns(2)
-            nome_pac = p1.text_input("Nome Completo*")
-            cpf_pac = p2.text_input("CPF")
-
-            p3, p4 = st.columns(2)
-            tel_pac = p3.text_input("Telefone / WhatsApp")
-            email_pac = p4.text_input("E-mail")
-
-            if st.form_submit_button("Cadastrar Paciente"):
-                novo_id = len(df_pac) + 1
-                novo_p = {
-                    "ID": novo_id,
-                    "Nome": nome_pac,
-                    "CPF": cpf_pac,
-                    "Telefone": tel_pac,
-                    "Email": email_pac,
-                    "Historico_Procedimentos": "",
-                    "Status": "Ativo",
-                }
-                df_pac = pd.concat(
-                    [df_pac, pd.DataFrame([novo_p])], ignore_index=True
-                )
-                write_data("Pacientes", df_pac)
-                st.success("Paciente cadastrado com sucesso!")
-                st.rerun()
-
-    st.markdown("---")
-    df_pac_active = (
-        df_pac[df_pac["Status"] == "Ativo"]
-        if not df_pac.empty
-        else pd.DataFrame()
-    )
-    if not df_pac_active.empty:
-        edited_pac = st.data_editor(
-            df_pac_active.drop(columns=["Status"], errors="ignore"),
-            use_container_width=True,
-            key="editor_pac",
-        )
-
-        if st.button("💾 Salvar Pacientes"):
-            for idx, row in edited_pac.iterrows():
-                pid = str(row["ID"]).strip()
-                mask = df_pac["ID"].astype(str).str.strip() == pid
-                df_pac.loc[mask, "Nome"] = row["Nome"]
-                df_pac.loc[mask, "CPF"] = row["CPF"]
-                df_pac.loc[mask, "Telefone"] = row["Telefone"]
-                df_pac.loc[mask, "Email"] = row["Email"]
-
-            write_data("Pacientes", df_pac)
-            st.success("Lista de pacientes atualizada!")
-            st.rerun()
-
-
-# ------------------------------------------
-# TAB 6: CAIXA / LIVRO CAIXA
-# ------------------------------------------
-with tab_caixa:
-    st.subheader("💵 Livro Caixa e Fluxo Financeiro")
-    df_caixa = read_data("Caixa", CAIXA_COLS)
-
-    with st.expander("➕ Lançar Movimentação Financeira", expanded=False):
-        with st.form("form_caixa"):
-            cx1, cx2, cx3 = st.columns(3)
-            data_cx = cx1.date_input("Data")
-            tipo_cx = cx2.selectbox("Tipo", ["Entrada", "Saída"])
-            cat_cx = cx3.selectbox(
-                "Categoria",
-                [
-                    "Procedimentos",
-                    "Materiais",
-                    "Aluguel",
-                    "Impostos",
-                    "Outros",
-                ],
-            )
-
-            cx4, cx5 = st.columns([2, 1])
-            desc_cx = cx4.text_input("Descrição")
-            val_cx = cx5.number_input(
-                "Valor (R$)", min_value=0.0, step=10.0
-            )
-
-            if st.form_submit_button("Lançar no Caixa"):
-                novo_id = len(df_caixa) + 1
-                novo_cx = {
-                    "ID": novo_id,
-                    "Data": str(data_cx),
-                    "Tipo": tipo_cx,
-                    "Categoria": cat_cx,
-                    "Descricao": desc_cx,
-                    "Valor": val_cx,
-                    "Status": "Ativo",
-                }
-                df_caixa = pd.concat(
-                    [df_caixa, pd.DataFrame([novo_cx])], ignore_index=True
-                )
-                write_data("Caixa", df_caixa)
-                st.success("Lançamento efetuado!")
-                st.rerun()
-
-    st.markdown("---")
-    df_cx_active = (
-        df_caixa[df_caixa["Status"] == "Ativo"]
-        if not df_caixa.empty
-        else pd.DataFrame()
-    )
-
-    if not df_cx_active.empty:
-        entradas = 0.0
-        saidas = 0.0
-        for _, r in df_cx_active.iterrows():
-            try:
-                v = float(str(r["Valor"]).replace(",", "."))
-            except Exception:
-                v = 0.0
-            if r["Tipo"] == "Entrada":
-                entradas += v
-            elif r["Tipo"] == "Saída":
-                saidas += v
-
-        saldo = entradas - saidas
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("🟢 Entradas Totais", f"R$ {entradas:,.2f}")
-        m2.metric("🔴 Saídas Totais", f"R$ {saidas:,.2f}")
-        m3.metric("🔵 Saldo Atual", f"R$ {saldo:,.2f}")
-
-        st.markdown("---")
-        st.dataframe(
-            df_cx_active.drop(columns=["Status"], errors="ignore"),
-            use_container_width=True,
-        )
-
-
-# ------------------------------------------
-# TAB 7: LIXEIRA (RESTAURAÇÃO DE DADOS)
-# ------------------------------------------
-with tab_lixeira:
-    st.subheader("🗑️ Lixeira do Sistema")
-    cat_del = st.selectbox(
-        "Selecione o módulo para visualizar ou restaurar:",
-        ["Materiais", "Procedimentos", "Agenda", "Pacientes", "Caixa"],
-    )
-
-    target_cols = {
-        "Materiais": MAT_COLS,
-        "Procedimentos": PROC_COLS,
-        "Agenda": AGENDA_COLS,
-        "Pacientes": PAC_COLS,
-        "Caixa": CAIXA_COLS,
-    }[cat_del]
-
-    df_trash_full = read_data(cat_del, target_cols)
-    df_trash = (
-        df_trash_full[df_trash_full["Status"] == "Excluido"]
-        if not df_trash_full.empty
-        else pd.DataFrame()
-    )
-
-    if not df_trash.empty:
-        st.dataframe(df_trash, use_container_width=True)
-
-        col_r1, col_r2 = st.columns([3, 1])
-        item_col = (
-            "Procedimento"
-            if cat_del == "Procedimentos"
-            else ("Material" if cat_del == "Materiais" else "ID")
-        )
-        item_rest = col_r1.selectbox(
-            "Selecionar item para restaurar:",
-            options=df_trash[item_col].tolist(),
-        )
-
-        if col_r2.button("♻️ Restaurar Item"):
-            mask = (
-                df_trash_full[item_col].astype(str).str.strip()
-                == str(item_rest).strip()
-            )
-            df_trash_full.loc[mask, "Status"] = "Ativo"
-            write_data(cat_del, df_trash_full)
-            st.success("Item restaurado com sucesso!")
-            st.rerun()
+    # Cálculo da Precificação
+    custo_tempo = custo_fixo_hora * tempo_procedimento
+    custo_base = custo_materiais + custo_tempo
+    
+    # Preço com margem e impostos sobre a venda
+    # Preço = (Custo Base + Lucro Fixo) / (1 - (Impostos% + Lucro%) / 100)
+    taxa_total_pct = (impostos_pct + margem_lucro_pct) / 100.0
+    
+    if taxa_total_pct < 1.0:
+        preco_sugerido = (custo_base + lucro_fixo_adicional) / (1.0 - taxa_total_pct)
+        lucro_bruto = preco_sugerido - custo_base - (preco_sugerido * (impostos_pct / 100.0))
     else:
-        st.info("Nenhum item excluído neste módulo.")
+        preco_sugerido = 0.0
+        lucro_bruto = 0.0
+
+    st.markdown("---")
+    st.subheader("Resultados do Cálculo")
+    res1, res2, res3 = st.columns(3)
+    res1.metric("Custo Total Operacional", f"R$ {custo_base:.2f}")
+    res2.metric("Preço Mínimo Sugerido", f"R$ {preco_sugerido:.2f}")
+    res3.metric("Lucro Líquido Estimado", f"R$ {lucro_bruto:.2f}")
+
+# ------------------------------------------
+# MÓDULO 4: LIVRO CAIXA & UPLOAD DE COMPROVANTES
+# ------------------------------------------
+elif menu == "💵 Livro Caixa":
+    st.title("💵 Gestão Financeira e Comprovantes")
+    
+    with st.form("form_caixa"):
+        st.subheader("Nova Lançamento Financeiro")
+        tipo = st.selectbox("Tipo", ["Receita", "Despesa"])
+        descricao = st.text_input("Descrição (ex: Consulta, Compra de Resina)")
+        valor = st.number_input("Valor (R$)", min_value=0.0, step=10.0)
+        data = st.date_input("Data do Lançamento", datetime.now())
+        
+        comprovante = st.file_uploader("Anexar Comprovante (PDF/Imagem)", type=["pdf", "png", "jpg", "jpeg"])
+        
+        submit_caixa = st.form_submit_button("Registrar Lançamento")
+        
+        if submit_caixa:
+            link_drive = None
+            if comprovante:
+                folder_id = st.secrets.get("DRIVE_FOLDER_ID", None)
+                bytes_data = comprovante.getvalue()
+                link_drive = upload_to_drive(
+                    bytes_data,
+                    f"{data}_{comprovante.name}",
+                    comprovante.type,
+                    folder_id=folder_id
+                )
+                st.info(f"Comprovante enviado ao Google Drive: {link_drive}")
+            
+            st.success("Lançamento registrado com sucesso!")
+
+# ------------------------------------------
+# MÓDULO 5: LIXEIRA / SEGURANÇA
+# ------------------------------------------
+elif menu == "🗑️ Lixeira":
+    st.title("🗑️ Segurança e Lixeira de Registros Excluídos")
+    st.caption("Esta aba armazena temporariamente os registros excluídos (soft-delete) para evitar perdas acidentais.")
+    
+    df_lixeira = load_data("Lixeira")
+    if not df_lixeira.empty:
+        st.dataframe(df_lixeira, use_container_width=True)
+        if st.button("Esvaziar Lixeira Permanentemente"):
+            st.warning("Funcionalidade restrita ao administrador do sistema.")
+    else:
+        st.info("A lixeira está vazia no momento.")
