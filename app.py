@@ -134,18 +134,28 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 def read_data(worksheet_name, default_columns):
     try:
-        df = conn.read(worksheet=worksheet_name, ttl=2)
+        # ttl=0 garante que a leitura seja SEMPRE em tempo real diretamente da planilha
+        df = conn.read(worksheet=worksheet_name, ttl=0)
         if df is None or df.empty:
             return pd.DataFrame(columns=default_columns)
         for col in default_columns:
             if col not in df.columns:
                 df[col] = ""
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"⚠️ Erro ao ler dados da aba '{worksheet_name}': {e}")
         return pd.DataFrame(columns=default_columns)
 
 def write_data(worksheet_name, df):
-    conn.update(worksheet=worksheet_name, data=df)
+    # TRAVA DE SEGURANÇA: NUNCA PERMITE SALVAR UMA TABELA VAZIA
+    if df is None or df.empty:
+        st.error(f"🛡️ TRAVA DE SEGURANÇA: Tentativa de salvar a tabela '{worksheet_name}' vazia foi bloqueada para proteger seus dados!")
+        return
+    try:
+        conn.update(worksheet=worksheet_name, data=df)
+        st.cache_data.clear()  # Força a limpeza total de qualquer cache em memória
+    except Exception as e:
+        st.error(f"❌ Erro ao salvar na planilha '{worksheet_name}': {e}")
 
 def get_drive_service():
     scopes = ['https://www.googleapis.com/auth/drive']
@@ -216,7 +226,7 @@ if 'authenticated' not in st.session_state:
 if 'current_user' not in st.session_state:
     st.session_state.current_user = None
 
-# PERSISTÊNCIA DE LOGIN VIA URL (impede deslogar ao clicar em links/redirecionamentos)
+# PERSISTÊNCIA DE LOGIN VIA URL
 if not st.session_state.authenticated:
     if "user" in st.query_params and st.query_params["user"] in USER_DATABASE:
         st.session_state.authenticated = True
@@ -239,7 +249,7 @@ def login_screen():
                 if username_input in USER_DATABASE and USER_DATABASE[username_input] == hashed_input:
                     st.session_state.authenticated = True
                     st.session_state.current_user = username_input
-                    st.query_params["user"] = username_input  # Mantém sessão salva na URL
+                    st.query_params["user"] = username_input
                     st.success("Acesso liberado!")
                     st.rerun()
                 else:
@@ -260,7 +270,7 @@ with c_user:
     if st.button("Sair / Logout"):
         st.session_state.authenticated = False
         st.session_state.current_user = None
-        st.query_params.clear()  # Limpa o token da URL
+        st.query_params.clear()
         st.rerun()
 
 def export_to_excel(df):
@@ -353,7 +363,7 @@ def recalcular_procedimentos_df(df_p, df_m_ref, aluguel_cons, imposto_g, lucro_g
         df_p.loc[idx, 'Qtd_Consultas'] = qtd_consultas
         df_p.loc[idx, 'Custo_Aluguel'] = round(custo_aluguel_total, 2)
         df_p.loc[idx, 'Tipo_Lucro'] = tipo_lucro
-        df_p.loc[idx, 'Lucro_Valor'] = round(valor_lucro, 2)
+        df_p.loc[idx, 'Lucro_Valor'] = round(val_lucro_input, 2)
         df_p.loc[idx, 'Imposto_Valor'] = round(valor_imposto, 2)
         df_p.loc[idx, 'Parcelas'] = f"{parcelas_sel}x"
         df_p.loc[idx, 'Taxa_Cartao_Pct'] = f"{taxa_cartao_pct}%"
@@ -461,7 +471,6 @@ with tab_mat:
                 df_mat = pd.concat([df_mat, pd.DataFrame([novo_reg])], ignore_index=True)
                 write_data("Materiais", df_mat)
 
-                # Sincroniza e recalcula os procedimentos afetados
                 df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
                 write_data("Procedimentos", df_proc_ref)
 
@@ -479,13 +488,13 @@ with tab_mat:
         edited_mat = st.data_editor(df_display.drop(columns=['Status'], errors='ignore'), use_container_width=True, key="editor_mat")
         if st.button("💾 Salvar Alterações na Planilha (Materiais)"):
             for idx, row in edited_mat.iterrows():
-                mat_id = row['ID']
-                df_mat.loc[df_mat['ID'] == mat_id, ['Material', 'Preco_Compra', 'Procedimentos_Vinculados', 'Rendimento_Pacientes', 'Custo_Por_Paciente']] = [
+                mat_id = str(row['ID']).strip()
+                mask = df_mat['ID'].astype(str).str.strip() == mat_id
+                df_mat.loc[mask, ['Material', 'Preco_Compra', 'Procedimentos_Vinculados', 'Rendimento_Pacientes', 'Custo_Por_Paciente']] = [
                     row['Material'], row['Preco_Compra'], row['Procedimentos_Vinculados'], row['Rendimento_Pacientes'], row['Custo_Por_Paciente']
                 ]
             write_data("Materiais", df_mat)
             
-            # Recalcula a precificação de procedimentos após alteração de material
             df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
             write_data("Procedimentos", df_proc_ref)
 
@@ -496,7 +505,8 @@ with tab_mat:
         c_del1, c_del2 = st.columns([3, 1])
         mat_del = c_del1.selectbox("Remover Material:", options=df_mat_active['Material'].tolist(), key="sel_del_mat")
         if c_del2.button("🗑️ Mover Material para Lixeira"):
-            df_mat.loc[df_mat['Material'] == mat_del, 'Status'] = 'Excluido'
+            mask = df_mat['Material'].astype(str).str.strip() == str(mat_del).strip()
+            df_mat.loc[mask, 'Status'] = 'Excluido'
             write_data("Materiais", df_mat)
             st.warning("Material movido para a lixeira!")
             st.rerun()
@@ -568,15 +578,14 @@ with tab_proc:
 
         if st.button("💾 Salvar Alterações e Recalcular Preços"):
             for idx, row in edited_proc.iterrows():
-                p_id = row['ID']
-                mask = df_proc['ID'] == p_id
+                p_id = str(row['ID']).strip()
+                mask = df_proc['ID'].astype(str).str.strip() == p_id
                 df_proc.loc[mask, 'Procedimento'] = row['Procedimento']
                 df_proc.loc[mask, 'Qtd_Consultas'] = row['Qtd_Consultas']
                 df_proc.loc[mask, 'Tipo_Lucro'] = row['Tipo_Lucro']
                 df_proc.loc[mask, 'Lucro_Valor'] = row['Lucro_Valor']
                 df_proc.loc[mask, 'Parcelas'] = row['Parcelas']
 
-            # RODA O RECÁLCULO COMPLETO MATEMÁTICO
             df_proc = recalcular_procedimentos_df(df_proc, df_mat_ref, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
             write_data("Procedimentos", df_proc)
             st.success("Alterações salvas e precificação recalculada com sucesso!")
@@ -586,7 +595,8 @@ with tab_proc:
         cp_del1, cp_del2 = st.columns([3, 1])
         proc_del = cp_del1.selectbox("Remover Procedimento:", options=df_proc_active['Procedimento'].tolist(), key="sel_del_proc")
         if cp_del2.button("🗑️ Mover Procedimento para Lixeira"):
-            df_proc.loc[df_proc['Procedimento'] == proc_del, 'Status'] = 'Excluido'
+            mask = df_proc['Procedimento'].astype(str).str.strip() == str(proc_del).strip()
+            df_proc.loc[mask, 'Status'] = 'Excluido'
             write_data("Procedimentos", df_proc)
             st.warning("Procedimento movido para a lixeira!")
             st.rerun()
@@ -808,8 +818,10 @@ with tab_ag:
                     novo_status_atend = c_status.selectbox("Status:", ["Marcado", "Concluído", "Cancelado"], index=1 if st_atend == "Concluído" else 0, key=f"st_{ag_item['ID']}")
                     
                     if c_save.button("💾 Salvar Prontuário", key=f"btn_save_pront_{ag_item['ID']}"):
-                        df_ag.loc[df_ag['ID'] == ag_item['ID'], 'Anotacoes_Clinicas'] = nova_anot
-                        df_ag.loc[df_ag['ID'] == ag_item['ID'], 'Status_Atendimento'] = novo_status_atend
+                        ag_id = str(ag_item['ID']).strip()
+                        mask_ag = df_ag['ID'].astype(str).str.strip() == ag_id
+                        df_ag.loc[mask_ag, 'Anotacoes_Clinicas'] = nova_anot
+                        df_ag.loc[mask_ag, 'Status_Atendimento'] = novo_status_atend
                         write_data("Agenda", df_ag)
 
                         p_nome = ag_item['Paciente']
@@ -973,7 +985,6 @@ with tab_cfg:
 
             write_data("Configuracoes", pd.DataFrame(novas_configs))
             
-            # Recalcula todos os procedimentos com as novas regras globais
             df_proc_ref = read_data("Procedimentos", PROC_COLS)
             df_mat_ref = read_data("Materiais", MAT_COLS)
             df_proc_ref = recalcular_procedimentos_df(df_proc_ref, df_mat_ref, novo_aluguel, novo_imposto, novo_lucro, novas_taxas)
@@ -1013,8 +1024,8 @@ with tab_trash:
             st.dataframe(df_ex, use_container_width=True)
             res_item = st.selectbox(f"Restaurar de {cat_del}:", options=df_ex[k_col].tolist())
             if st.button("🔄 Restaurar Item"):
-                df_t.loc[df_t[k_col] == res_item, 'Status'] = 'Ativo'
+                mask_t = df_t[k_col].astype(str).str.strip() == str(res_item).strip()
+                df_t.loc[mask_t, 'Status'] = 'Ativo'
                 write_data(cat_del, df_t)
                 st.success("Item restaurado!")
                 st.rerun()
-
