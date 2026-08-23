@@ -134,8 +134,8 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 def read_data(worksheet_name, default_columns):
     try:
-        # ttl=0 garante que a leitura seja SEMPRE em tempo real diretamente da planilha
-        df = conn.read(worksheet=worksheet_name, ttl=0)
+        # Cache de 10 minutos para proteger a cota de 60 req/min da API do Google Sheets
+        df = conn.read(worksheet=worksheet_name, ttl="10m")
         if df is None or df.empty:
             return pd.DataFrame(columns=default_columns)
         for col in default_columns:
@@ -143,7 +143,10 @@ def read_data(worksheet_name, default_columns):
                 df[col] = ""
         return df
     except Exception as e:
-        st.error(f"⚠️ Erro ao ler dados da aba '{worksheet_name}': {e}")
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            st.warning(f"⏳ Cota do Google atingida temporariamente para a aba '{worksheet_name}'. Aguarde alguns segundos...")
+        else:
+            st.error(f"⚠️ Erro ao ler dados da aba '{worksheet_name}': {e}")
         return pd.DataFrame(columns=default_columns)
 
 def write_data(worksheet_name, df):
@@ -153,7 +156,10 @@ def write_data(worksheet_name, df):
         return
     try:
         conn.update(worksheet=worksheet_name, data=df)
-        st.cache_data.clear()  # Força a limpeza total de qualquer cache em memória
+        # LIMPEZA INSTANTÂNEA DE CACHE: Força a releitura atualizada após qualquer alteração
+        st.cache_data.clear()
+        if hasattr(conn, "reset"):
+            conn.reset()
     except Exception as e:
         st.error(f"❌ Erro ao salvar na planilha '{worksheet_name}': {e}")
 
@@ -548,7 +554,7 @@ with tab_proc:
                 df_proc = pd.concat([df_proc, pd.DataFrame([novo_p])], ignore_index=True)
                 df_proc = recalcular_procedimentos_df(df_proc, df_mat_ref, aluguel_consulta, imposto_geral, lucro_geral, taxas_cartao)
                 write_data("Procedimentos", df_proc)
-                st.success("Procedimento cadastrado e calculado!")
+                st.success("Procedimento cadastrado e calculated!")
                 st.rerun()
 
     st.markdown("---")
