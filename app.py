@@ -94,7 +94,6 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Busca as credenciais independente do nome da chave no secrets
     if "gcp_service_account" in st.secrets:
         creds_dict = dict(st.secrets["gcp_service_account"])
     elif "gcp" in st.secrets:
@@ -987,4 +986,3 @@ with tab_lixeira:
             st.rerun()
     else:
         st.info("Nenhum item excluído neste módulo.")
-,
