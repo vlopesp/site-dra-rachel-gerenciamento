@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 import gspread
 import pandas as pd
 import streamlit as st
@@ -72,8 +73,20 @@ CAIXA_COLS = [
 
 
 # ------------------------------------------
-# CONEXÃO COM GOOGLE SHEETS
+# NORMALIZAÇÃO DE NOMES E CONEXÃO SHEETS
 # ------------------------------------------
+def normalizar_texto(texto):
+    """Remove acentos, espaços e maiúsculas para comparar nomes de abas com segurança."""
+    return (
+        unicodedata.normalize("NFKD", str(texto))
+        .encode("ASCII", "ignore")
+        .decode("utf-8")
+        .lower()
+        .replace(" ", "")
+        .replace("_", "")
+    )
+
+
 @st.cache_resource
 def get_gspread_client():
     scope = [
@@ -92,42 +105,56 @@ def get_spreadsheet():
     return client.open_by_key(sheet_id)
 
 
+def get_worksheet_safely(sh, target_name):
+    target_norm = normalizar_texto(target_name)
+    possible_targets = [target_norm]
+    if target_norm == "caixa":
+        possible_targets.append("livrocaixa")
+
+    worksheets = sh.worksheets()
+    for ws in worksheets:
+        if normalizar_texto(ws.title) in possible_targets:
+            return ws
+
+    titles = [w.title for w in worksheets]
+    raise Exception(
+        f"Aba '{target_name}' não foi encontrada. Abas presentes na planilha: {titles}"
+    )
+
+
 def read_data(sheet_name, expected_cols):
     try:
         sh = get_spreadsheet()
-        try:
-            worksheet = sh.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            if sheet_name == "Caixa":
-                worksheet = sh.worksheet("LivroCaixa")
-            else:
-                raise
-        data = worksheet.get_all_records()
-        df = pd.DataFrame(data)
+        ws = get_worksheet_safely(sh, sheet_name)
+        data = ws.get_all_values()
+
+        if not data or len(data) < 1:
+            return pd.DataFrame(columns=expected_cols)
+
+        headers = [str(h).strip() for h in data[0]]
+        rows = data[1:] if len(data) > 1 else []
+        df = pd.DataFrame(rows, columns=headers)
+
         for col in expected_cols:
             if col not in df.columns:
                 df[col] = ""
+
         return df[expected_cols]
     except Exception as e:
-        st.error(f"Erro ao ler aba '{sheet_name}': {e}")
+        st.error(f"Erro ao carregar a aba '{sheet_name}': {e}")
         return pd.DataFrame(columns=expected_cols)
 
 
 def write_data(sheet_name, df):
     try:
         sh = get_spreadsheet()
-        try:
-            worksheet = sh.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            if sheet_name == "Caixa":
-                worksheet = sh.worksheet("LivroCaixa")
-            else:
-                raise
-        worksheet.clear()
+        ws = get_worksheet_safely(sh, sheet_name)
+        ws.clear()
         df_to_write = df.fillna("")
-        worksheet.update(
-            [df_to_write.columns.values.tolist()] + df_to_write.values.tolist()
-        )
+        values = [
+            df_to_write.columns.values.tolist()
+        ] + df_to_write.values.tolist()
+        ws.update(values)
     except Exception as e:
         st.error(f"Erro ao salvar na aba '{sheet_name}': {e}")
 
@@ -426,8 +453,12 @@ with tab_mat:
             for idx, row in edited_mat.iterrows():
                 m_id = str(row["ID"]).strip()
                 mask = df_mat["ID"].astype(str).str.strip() == m_id
-                c_emb = float(row["Custo_Embalagem"])
-                rend = int(row["Rendimento"]) if int(row["Rendimento"]) > 0 else 1
+                c_emb = float(str(row["Custo_Embalagem"]).replace(",", "."))
+                rend = (
+                    int(float(str(row["Rendimento"]).replace(",", ".")))
+                    if int(float(str(row["Rendimento"]).replace(",", "."))) > 0
+                    else 1
+                )
                 df_mat.loc[mask, "Material"] = row["Material"]
                 df_mat.loc[mask, "Custo_Embalagem"] = round(c_emb, 2)
                 df_mat.loc[mask, "Rendimento"] = rend
@@ -466,7 +497,6 @@ with tab_proc:
     df_proc = read_data("Procedimentos", PROC_COLS)
     df_mat_ref = read_data("Materiais", MAT_COLS)
 
-    # Recalcula dinamicamente em tempo real ao carregar
     if not df_proc.empty:
         df_proc = recalcular_procedimentos_df(
             df_proc,
@@ -673,7 +703,14 @@ with tab_agenda:
                     df_proc_ref["Procedimento"] == proc_sel
                 ]
                 if not match_p.empty:
-                    val_sug = float(match_p["Total_PIX"].values[0])
+                    try:
+                        val_sug = float(
+                            str(match_p["Total_PIX"].values[0]).replace(
+                                ",", "."
+                            )
+                        )
+                    except Exception:
+                        val_sug = 0.0
 
             val_cobrado = a5.number_input(
                 "Valor Cobrado (R$)", value=val_sug, step=10.0
@@ -853,23 +890,24 @@ with tab_caixa:
     )
 
     if not df_cx_active.empty:
-        # Métricas resumidas
-        entradas = df_cx_active[df_cx_active["Tipo"] == "Entrada"][
-            "Valor"
-        ].astype(float).sum()
-        saidas = df_cx_active[df_cx_active["Tipo"] == "Saída"]["Valor"].astype(
-            float
-        ).sum()
+        entradas = 0.0
+        saidas = 0.0
+        for _, r in df_cx_active.iterrows():
+            try:
+                v = float(str(r["Valor"]).replace(",", "."))
+            except Exception:
+                v = 0.0
+            if r["Tipo"] == "Entrada":
+                entradas += v
+            elif r["Tipo"] == "Saída":
+                saidas += v
+
         saldo = entradas - saidas
 
         m1, m2, m3 = st.columns(3)
         m1.metric("🟢 Entradas Totais", f"R$ {entradas:,.2f}")
         m2.metric("🔴 Saídas Totais", f"R$ {saidas:,.2f}")
-        m3.metric(
-            "🔵 Saldo Atual",
-            f"R$ {saldo:,.2f}",
-            delta=f"R$ {saldo:,.2f}",
-        )
+        m3.metric("🔵 Saldo Atual", f"R$ {saldo:,.2f}")
 
         st.markdown("---")
         st.dataframe(
