@@ -73,7 +73,7 @@ CAIXA_COLS = [
 
 
 # ------------------------------------------
-# NORMALIZAÇÃO DE NOMES E CONEXÃO SHEETS
+# NORMALIZAÇÃO DE NOMES E CONEXÃO BLINDADA
 # ------------------------------------------
 def normalizar_texto(texto):
     """Remove acentos, espaços e maiúsculas para comparar nomes de abas com segurança."""
@@ -93,15 +93,36 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scope
-    )
+
+    # Busca as credenciais independente do nome da chave no secrets
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+    elif "gcp" in st.secrets:
+        creds_dict = dict(st.secrets["gcp"])
+    else:
+        creds_dict = dict(st.secrets)
+
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace(
+            "\\n", "\n"
+        )
+
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(creds)
 
 
 def get_spreadsheet():
     client = get_gspread_client()
-    sheet_id = st.secrets["sheets"]["spreadsheet_id"]
+
+    if "sheets" in st.secrets and "spreadsheet_id" in st.secrets["sheets"]:
+        sheet_id = st.secrets["sheets"]["spreadsheet_id"]
+    elif "spreadsheet_id" in st.secrets:
+        sheet_id = st.secrets["spreadsheet_id"]
+    else:
+        raise KeyError(
+            "Chave 'spreadsheet_id' não foi encontrada nos secrets do Streamlit."
+        )
+
     return client.open_by_key(sheet_id)
 
 
@@ -966,3 +987,4 @@ with tab_lixeira:
             st.rerun()
     else:
         st.info("Nenhum item excluído neste módulo.")
+,
