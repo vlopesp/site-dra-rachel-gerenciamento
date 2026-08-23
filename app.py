@@ -94,10 +94,11 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    if "gcp_service_account" in st.secrets:
+    # Lê as credenciais diretamente do bloco [connections.gsheets]
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        creds_dict = dict(st.secrets["connections"]["gsheets"])
+    elif "gcp_service_account" in st.secrets:
         creds_dict = dict(st.secrets["gcp_service_account"])
-    elif "gcp" in st.secrets:
-        creds_dict = dict(st.secrets["gcp"])
     else:
         creds_dict = dict(st.secrets)
 
@@ -113,16 +114,25 @@ def get_gspread_client():
 def get_spreadsheet():
     client = get_gspread_client()
 
-    if "sheets" in st.secrets and "spreadsheet_id" in st.secrets["sheets"]:
-        sheet_id = st.secrets["sheets"]["spreadsheet_id"]
+    # Busca a URL ou ID no bloco [connections.gsheets]
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        sec = st.secrets["connections"]["gsheets"]
+        sheet_target = sec.get("spreadsheet") or sec.get("spreadsheet_id")
     elif "spreadsheet_id" in st.secrets:
-        sheet_id = st.secrets["spreadsheet_id"]
+        sheet_target = st.secrets["spreadsheet_id"]
+    elif "sheets" in st.secrets and "spreadsheet_id" in st.secrets["sheets"]:
+        sheet_target = st.secrets["sheets"]["spreadsheet_id"]
     else:
         raise KeyError(
-            "Chave 'spreadsheet_id' não foi encontrada nos secrets do Streamlit."
+            "Não foi encontrada a chave 'spreadsheet' ou 'spreadsheet_id' no seu secrets.toml."
         )
 
-    return client.open_by_key(sheet_id)
+    sheet_str = str(sheet_target).strip()
+
+    # Abre por URL se contiver o link, ou por ID caso seja apenas a chave
+    if "docs.google.com" in sheet_str:
+        return client.open_by_url(sheet_str)
+    return client.open_by_key(sheet_str)
 
 
 def get_worksheet_safely(sh, target_name):
